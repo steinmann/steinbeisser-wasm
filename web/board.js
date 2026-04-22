@@ -20,13 +20,13 @@ export const FRAME_POINTS = [
 ];
 
 export const COLORS = {
-  pageBackground: '#262A31',
+  pageBackground: '#1A1D23',
   frameStroke: '#505B73',
   slotFill: '#333B4A',
   slotStroke: '#4E5971',
-  blackOuter: '#272B33',
+  blackOuter: '#22262D',
   blackInner: '#0B0F17',
-  whiteOuter: '#272B33',
+  whiteOuter: '#D4D9E0',
   whiteInner: '#E6EBF2',
   accent: '#FF5A62',
 };
