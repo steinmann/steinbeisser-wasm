@@ -280,8 +280,8 @@ function render() {
   const showSpeedTestResult = !noticeValue && !showThinking && !!state.speedTestResult;
   const showSearchInfo =
     !noticeValue &&
-    !showThinking &&
     !showSpeedTestResult &&
+    (!showThinking || state.demoMode) &&
     !!state.lastEngineSearchInfo;
   speedTestPanel.hidden = !showSpeedTestResult;
   if (showSpeedTestResult) {
