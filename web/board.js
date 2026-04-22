@@ -2,14 +2,14 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
 
 export const VIEWBOX = { minX: 0, minY: -120, width: 1884, height: 1680 };
 export const SLOT_RADIUS = 74;
-const PIECE_OUTER_RADIUS = 64;
-const PIECE_INNER_RADIUS = 60;
-const PIECE_RING_WIDTH = PIECE_OUTER_RADIUS - PIECE_INNER_RADIUS;
-const PIECE_STROKED_RADIUS = PIECE_INNER_RADIUS + (PIECE_RING_WIDTH / 2);
-const CAPTURE_OUTER_RADIUS = PIECE_OUTER_RADIUS;
-const CAPTURE_INNER_RADIUS = PIECE_INNER_RADIUS;
-const CAPTURE_RING_WIDTH = CAPTURE_OUTER_RADIUS - CAPTURE_INNER_RADIUS;
-const CAPTURE_STROKED_RADIUS = CAPTURE_INNER_RADIUS + (CAPTURE_RING_WIDTH / 2);
+const BLACK_PIECE_OUTER_RADIUS = 65;
+const WHITE_PIECE_OUTER_RADIUS = 64.75;
+const BLACK_PIECE_INNER_RADIUS = 60.5;
+const WHITE_PIECE_INNER_RADIUS = 60.25;
+const BLACK_CAPTURE_OUTER_RADIUS = BLACK_PIECE_OUTER_RADIUS;
+const WHITE_CAPTURE_OUTER_RADIUS = WHITE_PIECE_OUTER_RADIUS;
+const BLACK_CAPTURE_INNER_RADIUS = BLACK_PIECE_INNER_RADIUS;
+const WHITE_CAPTURE_INNER_RADIUS = WHITE_PIECE_INNER_RADIUS;
 export const FRAME_POINTS = [
   [533, 60],
   [1314, 60],
@@ -24,9 +24,9 @@ export const COLORS = {
   frameStroke: '#505B73',
   slotFill: '#333B4A',
   slotStroke: '#4E5971',
-  blackOuter: '#22262D',
+  blackOuter: '#1E2430',
   blackInner: '#0B0F17',
-  whiteOuter: '#D4D9E0',
+  whiteOuter: '#4E5971',
   whiteInner: '#E6EBF2',
   accent: '#FF5A62',
 };
@@ -314,16 +314,26 @@ function appendPieces(group, positionState) {
     }
     const outerFill = occupant === 'black' ? COLORS.blackOuter : COLORS.whiteOuter;
     const innerFill = occupant === 'black' ? COLORS.blackInner : COLORS.whiteInner;
+    const outerRadius =
+      occupant === 'black' ? BLACK_PIECE_OUTER_RADIUS : WHITE_PIECE_OUTER_RADIUS;
+    const innerRadius =
+      occupant === 'black' ? BLACK_PIECE_INNER_RADIUS : WHITE_PIECE_INNER_RADIUS;
 
     const marbleGroup = svg('g');
     marbleGroup.append(
       svg('circle', {
         cx: cell.x,
         cy: cell.y,
-        r: PIECE_STROKED_RADIUS,
+        r: outerRadius,
+        fill: outerFill,
+      }),
+    );
+    marbleGroup.append(
+      svg('circle', {
+        cx: cell.x,
+        cy: cell.y,
+        r: innerRadius,
         fill: innerFill,
-        stroke: outerFill,
-        'stroke-width': PIECE_RING_WIDTH,
       }),
     );
     group.append(marbleGroup);
@@ -343,10 +353,16 @@ function appendCapturedPieces(group, session) {
       svg('circle', {
         cx: x,
         cy: WHITE_CAPTURE_Y,
-        r: CAPTURE_STROKED_RADIUS,
+        r: WHITE_CAPTURE_OUTER_RADIUS,
+        fill: COLORS.whiteOuter,
+      }),
+    );
+    marbleGroup.append(
+      svg('circle', {
+        cx: x,
+        cy: WHITE_CAPTURE_Y,
+        r: WHITE_CAPTURE_INNER_RADIUS,
         fill: COLORS.whiteInner,
-        stroke: COLORS.whiteOuter,
-        'stroke-width': CAPTURE_RING_WIDTH,
       }),
     );
     group.append(marbleGroup);
@@ -358,10 +374,16 @@ function appendCapturedPieces(group, session) {
       svg('circle', {
         cx: x,
         cy: BLACK_CAPTURE_Y,
-        r: CAPTURE_STROKED_RADIUS,
+        r: BLACK_CAPTURE_OUTER_RADIUS,
+        fill: COLORS.blackOuter,
+      }),
+    );
+    marbleGroup.append(
+      svg('circle', {
+        cx: x,
+        cy: BLACK_CAPTURE_Y,
+        r: BLACK_CAPTURE_INNER_RADIUS,
         fill: COLORS.blackInner,
-        stroke: COLORS.blackOuter,
-        'stroke-width': CAPTURE_RING_WIDTH,
       }),
     );
     group.append(marbleGroup);

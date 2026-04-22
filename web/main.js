@@ -23,7 +23,7 @@ const {
 } = boardModule;
 
 const DEFAULT_MAX_DEPTH = 17;
-const DEFAULT_MAX_TIME_SECONDS = 1;
+const DEFAULT_MAX_TIME_SECONDS = 3;
 const MIN_MAX_DEPTH = 1;
 const MAX_MAX_DEPTH = 64;
 const MIN_MAX_TIME_SECONDS = 1;
