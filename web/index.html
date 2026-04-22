@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Cache-Control" content="no-store, max-age=0, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <title>Steinbeisser</title>
+    <link rel="stylesheet" href="./style.css?build=__BUILD_ID__" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="board-section">
+        <div class="board-area">
+          <div class="eval-rail">
+            <div class="eval-bar" aria-hidden="true">
+              <div class="eval-fill" data-eval-fill></div>
+            </div>
+            <div class="ply-counter" aria-live="polite">
+              <span class="ply-counter-value">0 / 350</span>
+            </div>
+          </div>
+          <div class="board-frame" data-board></div>
+        </div>
+      </section>
+
+      <aside class="control-panel">
+        <div class="control-group">
+          <button class="control-button" type="button" data-action="speed-test">Speed</button>
+          <button class="control-button" type="button" data-action="demo">Demo</button>
+          <button class="control-button" type="button" data-action="toggle-side">Play white</button>
+          <button class="control-button" type="button" data-action="reset">Reset</button>
+          <button class="control-button" type="button" data-action="takeback">Take back</button>
+        </div>
+
+        <div class="control-group search-settings">
+          <label class="setting-field">
+            <span class="setting-header">
+              <span class="setting-label">Max depth</span>
+              <button
+                class="toggle-switch"
+                type="button"
+                data-toggle="depth-limit"
+                aria-pressed="false"
+                aria-label="Toggle depth limit"
+              >
+                <span class="toggle-thumb"></span>
+              </button>
+            </span>
+            <input
+              class="setting-input"
+              type="number"
+              min="1"
+              max="64"
+              step="1"
+              value="17"
+              inputmode="numeric"
+              data-setting="max-depth"
+            />
+          </label>
+          <label class="setting-field">
+            <span class="setting-header">
+              <span class="setting-label">Max time (s)</span>
+              <button
+                class="toggle-switch"
+                type="button"
+                data-toggle="time-limit"
+                aria-pressed="true"
+                aria-label="Toggle time limit"
+              >
+                <span class="toggle-thumb"></span>
+              </button>
+            </span>
+            <input
+              class="setting-input"
+              type="number"
+              min="1"
+              max="600"
+              step="1"
+              value="1"
+              inputmode="numeric"
+              data-setting="max-time-seconds"
+            />
+          </label>
+        </div>
+
+        <div class="status-panel">
+          <div class="thinking-dots" data-thinking-dots hidden aria-hidden="true">
+            <span></span>
+            <span></span>
+            <span></span>
+          </div>
+          <p class="search-info-text" data-search-info hidden></p>
+          <div class="speed-test-panel" data-speed-test-panel hidden>
+            <table class="speed-test-table" aria-label="Speed test results">
+              <tbody>
+                <tr>
+                  <th scope="row">Depth</th>
+                  <td data-speed-test-depth></td>
+                </tr>
+                <tr>
+                  <th scope="row">Speed</th>
+                  <td data-speed-test-speed></td>
+                </tr>
+                <tr>
+                  <th scope="row">Time</th>
+                  <td data-speed-test-time></td>
+                </tr>
+                <tr>
+                  <th scope="row">Nodes</th>
+                  <td data-speed-test-nodes></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="notice-text" data-notice></p>
+        </div>
+      </aside>
+    </main>
+
+    <script type="module" src="./main.js?build=__BUILD_ID__"></script>
+  </body>
+</html>
