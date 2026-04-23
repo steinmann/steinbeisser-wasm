@@ -302,7 +302,7 @@ function render() {
   renderEvaluationBar(status);
   syncEvaluationBarGeometry();
   evalRail.classList.toggle('is-hidden', !state.debugEnabled);
-  demoButton.textContent = state.demoMode ? 'Pause Demo' : 'Demo';
+  demoButton.textContent = state.demoMode ? 'Pause self-play' : 'Self-play';
   demoButton.setAttribute('aria-pressed', state.demoMode ? 'true' : 'false');
   demoButton.disabled = false;
   toggleSideButton.textContent = state.humanColor === 'black' ? 'Play white' : 'Play black';
