@@ -85,15 +85,12 @@ body {
 }
 
 .ply-counter {
-  display: flex;
-  align-items: center;
   color: #aeb7c7;
-  text-align: center;
-}
-
-.ply-counter-value {
   font-size: 15px;
   line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  text-align: center;
   white-space: nowrap;
 }
 
@@ -108,6 +105,10 @@ body {
   width: 100%;
   height: auto;
   max-height: 88vh;
+}
+
+.board-svg [tabindex]:focus {
+  outline: none;
 }
 
 .control-panel {
@@ -128,7 +129,7 @@ body {
 
 .search-settings {
   gap: 10px;
-  margin-top: 14px;
+  margin-top: 20px;
 }
 
 .setting-field {
@@ -208,6 +209,7 @@ body {
   color: #e6ebf2;
   padding: 10px 12px;
   font: inherit;
+  text-align: center;
   outline: none;
   transition: background 140ms ease, border-color 140ms ease;
 }
@@ -216,6 +218,15 @@ body {
 .setting-input:focus-visible {
   background: #3b4557;
   border-color: #5f6d87;
+}
+
+.setting-input.is-inactive:not(:disabled) {
+  opacity: 0.55;
+}
+
+.setting-input.is-inactive:not(:disabled):hover,
+.setting-input.is-inactive:not(:disabled):focus-visible {
+  opacity: 0.8;
 }
 
 .setting-input:disabled {
@@ -247,6 +258,19 @@ body {
   outline: none;
 }
 
+.control-button[aria-pressed='true'] {
+  background: #3b4557;
+  border-color: #5f6d87;
+  color: #e6ebf2;
+}
+
+.control-button[aria-pressed='true']:hover:not(:disabled),
+.control-button[aria-pressed='true']:focus-visible:not(:disabled) {
+  background: #444f63;
+  border-color: #6a7893;
+  color: #e6ebf2;
+}
+
 .control-button:disabled {
   opacity: 0.45;
   cursor: default;
@@ -257,8 +281,9 @@ body {
 }
 
 .status-panel {
-  min-height: 72px;
   align-items: center;
+  justify-content: flex-start;
+  height: 124px;
 }
 
 .search-info-text {
@@ -324,23 +349,17 @@ body {
 }
 
 .thinking-dots[hidden] {
-  display: none !important;
+  display: inline-flex !important;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .thinking-dots span {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #ff5a62;
-  animation: pulse 1s infinite ease-in-out;
-}
-
-.thinking-dots[data-side='black'] span {
-  background: #0b0f17;
-}
-
-.thinking-dots[data-side='white'] span {
   background: #e6ebf2;
+  animation: pulse 1s infinite ease-in-out;
 }
 
 .thinking-dots span:nth-child(2) {

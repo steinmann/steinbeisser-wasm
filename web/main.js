@@ -28,7 +28,6 @@ const MIN_MAX_DEPTH = 1;
 const MAX_MAX_DEPTH = 64;
 const MIN_MAX_TIME_SECONDS = 1;
 const MAX_MAX_TIME_SECONDS = 600;
-const SPEED_TEST_DEPTH = 17;
 const EVAL_EXPECTED_OUTCOME_SCORE_SCALE = 996;
 
 const state = {
@@ -57,10 +56,10 @@ const state = {
 let initialSessionPosition = null;
 
 const boardContainer = document.querySelector('[data-board]');
+const plyCounterValue = document.querySelector('[data-ply-counter]');
 const evalRail = document.querySelector('.eval-rail');
 const evalBar = document.querySelector('.eval-bar');
 const evalFill = document.querySelector('[data-eval-fill]');
-const plyCounterValue = document.querySelector('.ply-counter-value');
 const speedTestButton = document.querySelector('[data-action="speed-test"]');
 const demoButton = document.querySelector('[data-action="demo"]');
 const toggleSideButton = document.querySelector('[data-action="toggle-side"]');
@@ -104,7 +103,12 @@ function engineColor() {
 }
 
 function canHumanAct(status) {
-  return !state.demoMode && !state.thinking && !status.isGameOver && status.sideToMove === state.humanColor;
+  return (
+    !state.demoMode &&
+    !isBlockingSearch() &&
+    !status.isGameOver &&
+    status.sideToMove === state.humanColor
+  );
 }
 
 function setSearchLimitEnabled(limit, enabled) {
@@ -138,6 +142,10 @@ function formatNps(nodes, elapsedMs) {
 
 function formatElapsedTime(elapsedMs) {
   return `${(Math.max(elapsedMs, 1) / 1000).toFixed(2)} s`;
+}
+
+function formatPlyCounter(turnIndex) {
+  return `${turnIndex}/350`;
 }
 
 function clearSearchInfo() {
@@ -177,6 +185,10 @@ function clearTransientNotice() {
 function clearSelection() {
   state.selected = [];
   state.candidates = [];
+}
+
+function isBlockingSearch() {
+  return state.activeRequestId !== null;
 }
 
 function effectiveWhiteScore(sessionStatus) {
@@ -230,8 +242,10 @@ function resultCopy(result) {
 function render() {
   const status = session_status(state.session);
   const searchInFlight = state.activeRequestId !== null;
+  const blockingSearch = isBlockingSearch();
   const speedTestInFlight = state.activeSearchKind === 'speed-test';
-  const locked = state.demoMode || searchInFlight || status.isGameOver || status.sideToMove !== state.humanColor;
+  const locked =
+    state.demoMode || blockingSearch || status.isGameOver || status.sideToMove !== state.humanColor;
   const showThinking =
     searchInFlight &&
     !status.result &&
@@ -248,14 +262,16 @@ function render() {
     onBackgroundClick: handleBoardBackgroundClick,
   });
 
+  if (plyCounterValue) {
+    plyCounterValue.textContent = formatPlyCounter(status.turnIndex);
+  }
   renderEvaluationBar(status);
   syncEvaluationBarGeometry();
-  plyCounterValue.textContent = `${status.turnIndex} / 350`;
   speedTestButton.textContent = state.activeSearchKind === 'speed-test' ? 'Testing...' : 'Speed';
-  speedTestButton.disabled = searchInFlight || state.demoMode;
+  speedTestButton.disabled = speedTestInFlight || state.demoMode;
   demoButton.textContent = state.demoMode ? 'Stop Demo' : 'Demo';
   demoButton.setAttribute('aria-pressed', state.demoMode ? 'true' : 'false');
-  demoButton.disabled = searchInFlight && !state.demoMode;
+  demoButton.disabled = speedTestInFlight;
   toggleSideButton.textContent = state.humanColor === 'black' ? 'Play white' : 'Play black';
   toggleSideButton.disabled = state.demoMode || state.activeSearchKind === 'speed-test';
   takeBackButton.disabled = state.demoMode || speedTestInFlight || !status.canTakeBack;
@@ -263,10 +279,12 @@ function render() {
     state.demoMode || speedTestInFlight || state.session.position === initialSessionPosition;
   depthLimitToggle.setAttribute('aria-pressed', state.depthLimitEnabled ? 'true' : 'false');
   timeLimitToggle.setAttribute('aria-pressed', state.timeLimitEnabled ? 'true' : 'false');
-  depthLimitToggle.disabled = searchInFlight || state.demoMode;
-  timeLimitToggle.disabled = searchInFlight || state.demoMode;
-  maxDepthInput.disabled = searchInFlight || state.demoMode || !state.depthLimitEnabled;
-  maxTimeInput.disabled = searchInFlight || state.demoMode || !state.timeLimitEnabled;
+  depthLimitToggle.disabled = state.demoMode || speedTestInFlight;
+  timeLimitToggle.disabled = state.demoMode || speedTestInFlight;
+  maxDepthInput.disabled = state.demoMode || speedTestInFlight;
+  maxTimeInput.disabled = state.demoMode || speedTestInFlight;
+  maxDepthInput.classList.toggle('is-inactive', !state.depthLimitEnabled);
+  maxTimeInput.classList.toggle('is-inactive', !state.timeLimitEnabled);
   syncSearchInputs();
 
   if (showThinking) {
@@ -278,11 +296,7 @@ function render() {
 
   const noticeValue = state.notice || (status.result ? resultCopy(status.result) : '');
   const showSpeedTestResult = !noticeValue && !showThinking && !!state.speedTestResult;
-  const showSearchInfo =
-    !noticeValue &&
-    !showSpeedTestResult &&
-    (!showThinking || state.demoMode) &&
-    !!state.lastEngineSearchInfo;
+  const showSearchInfo = false;
   speedTestPanel.hidden = !showSpeedTestResult;
   if (showSpeedTestResult) {
     speedTestSpeed.textContent = state.speedTestResult.speed;
@@ -297,7 +311,7 @@ function render() {
   }
 
   searchInfoText.hidden = !showSearchInfo;
-  searchInfoText.textContent = showSearchInfo ? state.lastEngineSearchInfo : '';
+  searchInfoText.textContent = '';
 
   noticeText.hidden = !noticeValue;
   noticeText.textContent = noticeValue;
@@ -347,6 +361,10 @@ function handleCellClick(coord) {
 }
 
 async function handleCandidateClick(candidate) {
+  await applyHumanMove(candidate.move);
+}
+
+async function applyHumanMove(moveText) {
   const status = session_status(state.session);
   if (!canHumanAct(status)) {
     return;
@@ -355,7 +373,7 @@ async function handleCandidateClick(candidate) {
 
   try {
     clearSearchInfo();
-    state.session = apply_move(state.session, candidate.move);
+    state.session = apply_move(state.session, moveText);
     clearSelection();
     clearNotice();
     render();
@@ -546,7 +564,7 @@ async function runSpeedTest() {
     type: 'search',
     kind: 'speed-test',
     requestId,
-    maxDepth: SPEED_TEST_DEPTH,
+    maxDepth: state.maxDepth,
     maxTimeMs: 0,
     session: state.session,
   });
@@ -574,7 +592,7 @@ demoButton.addEventListener('click', async () => {
   clearTransientNotice();
   if (state.demoMode) {
     state.demoMode = false;
-    if (state.thinking) {
+    if (state.activeRequestId !== null) {
       await cancelSearch();
     }
     await resetBoardState();
@@ -588,6 +606,9 @@ demoButton.addEventListener('click', async () => {
 });
 
 speedTestButton.addEventListener('click', async () => {
+  if (state.activeRequestId !== null || state.demoMode) {
+    return;
+  }
   clearTransientNotice();
   await runSpeedTest();
 });
@@ -595,32 +616,32 @@ speedTestButton.addEventListener('click', async () => {
 toggleSideButton.addEventListener('click', async () => {
   clearTransientNotice();
   state.demoMode = false;
-  if (state.thinking) {
+  if (state.activeRequestId !== null) {
     await cancelSearch();
   }
   state.humanColor = engineColor();
   await resetBoardState();
 });
 
-depthLimitToggle.addEventListener('click', () => {
+depthLimitToggle.addEventListener('click', async () => {
   clearTransientNotice();
-  if (state.activeRequestId !== null) {
+  if (isBlockingSearch()) {
     return;
   }
   setSearchLimitEnabled('depth', !state.depthLimitEnabled);
   render();
 });
 
-timeLimitToggle.addEventListener('click', () => {
+timeLimitToggle.addEventListener('click', async () => {
   clearTransientNotice();
-  if (state.activeRequestId !== null) {
+  if (isBlockingSearch()) {
     return;
   }
   setSearchLimitEnabled('time', !state.timeLimitEnabled);
   render();
 });
 
-maxDepthInput.addEventListener('change', () => {
+maxDepthInput.addEventListener('change', async () => {
   clearTransientNotice();
   state.maxDepth = clampInteger(
     maxDepthInput.value,
@@ -629,9 +650,10 @@ maxDepthInput.addEventListener('change', () => {
     MAX_MAX_DEPTH,
   );
   syncSearchInputs();
+  render();
 });
 
-maxTimeInput.addEventListener('change', () => {
+maxTimeInput.addEventListener('change', async () => {
   clearTransientNotice();
   state.maxTimeSeconds = clampInteger(
     maxTimeInput.value,
@@ -640,12 +662,13 @@ maxTimeInput.addEventListener('change', () => {
     MAX_MAX_TIME_SECONDS,
   );
   syncSearchInputs();
+  render();
 });
 
 takeBackButton.addEventListener('click', async () => {
   clearTransientNotice();
   try {
-    if (state.thinking) {
+    if (state.activeRequestId !== null) {
       await cancelSearch();
     }
     state.session = undo_full_turn(state.session);
@@ -665,7 +688,7 @@ takeBackButton.addEventListener('click', async () => {
 resetButton.addEventListener('click', async () => {
   clearTransientNotice();
   state.demoMode = false;
-  if (state.thinking) {
+  if (state.activeRequestId !== null) {
     await cancelSearch();
   }
   await resetBoardState();

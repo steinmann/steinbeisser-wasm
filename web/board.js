@@ -28,7 +28,7 @@ export const COLORS = {
   blackInner: '#0B0F17',
   whiteOuter: '#4E5971',
   whiteInner: '#E6EBF2',
-  accent: '#FF5A62',
+  accent: '#FF8A47',
 };
 
 const ROWS = 'ABCDEFGHI';
@@ -400,7 +400,7 @@ function appendSelectionMarkers(group, selected) {
       svg('circle', {
         cx: cell.x,
         cy: cell.y,
-        r: 28,
+        r: 23,
         fill: COLORS.accent,
         'pointer-events': 'none',
       }),
