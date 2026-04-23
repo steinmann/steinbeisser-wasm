@@ -1582,7 +1582,7 @@ const EVAL_CACHE_SIZE: usize = 1 << 17;
 const MAX_PLY: usize = 96;
 const CODINGAME_FIRST_TURN_MS: u64 = 500;
 const CODINGAME_TURN_MS: u64 = 45;
-const SEARCH_DEADLINE_SLACK_MS: u64 = 4;
+const SEARCH_DEADLINE_SLACK_MS: u64 = 10;
 const ABORT_POLL_MASK: u64 = 8191;
 const RAW_ABORT_POLL_MASK: u64 = 2047;
 const ROOT_REVERSE_MOVE_PENALTY: i32 = 200;
@@ -2016,6 +2016,15 @@ impl Searcher {
     fn gt(&self, ply: u8) -> u16 {
         self.root_turn.saturating_add(u16::from(ply))
     }
+    fn terminal_depth_limit(&self) -> u8 {
+        MAX_GAME_TURNS
+            .saturating_sub(self.root_turn)
+            .max(1)
+            .min(u16::from(u8::MAX)) as u8
+    }
+    fn reaches_terminal_horizon(&self, ply: u8, d: u8) -> bool {
+        self.gt(ply).saturating_add(u16::from(d)) >= MAX_GAME_TURNS
+    }
     fn persist(&mut self) {
         store_persistent_context(PersistentContext {
             generation: self.generation,
@@ -2434,7 +2443,11 @@ impl Searcher {
                 )
                 .map(|score| -score);
         }
-        let can_reduce = is_quiet && d >= _aM && _p >= _aN && history_score < HISTORY_LMR_THRESHOLD;
+        let can_reduce = !self.reaches_terminal_horizon(ply, d)
+            && is_quiet
+            && d >= _aM
+            && _p >= _aN
+            && history_score < HISTORY_LMR_THRESHOLD;
         let base_reduction = if can_reduce { _N(d, _p) } else { 0 };
         let reduction = if can_reduce {
             let mut tuned = base_reduction;
@@ -2502,9 +2515,10 @@ impl Searcher {
             return Ok(score);
         }
         let key = history.search_key(current, self.gt(ply));
+        let exact_terminal_horizon = self.reaches_terminal_horizon(ply, d);
         let mut beta = beta;
         let mut raw_static = None;
-        if let Some(en) = self.tt.probe(key, d) {
+        if !exact_terminal_horizon && let Some(en) = self.tt.probe(key, d) {
             let score = decode_tt_score(en.score, ply);
             match en.bound {
                 Bk::Exact => {
@@ -2552,7 +2566,7 @@ impl Searcher {
         } else {
             None
         };
-        if ply > 0 && d <= 4 {
+        if !exact_terminal_horizon && ply > 0 && d <= 4 {
             let ss = ss.unwrap_or_else(|| {
                 self.corrected_eval(
                     st,
@@ -2566,7 +2580,7 @@ impl Searcher {
                 return Ok(ss);
             }
         }
-        if d <= 2 && alpha > -_D / 2 && beta < _D / 2 {
+        if !exact_terminal_horizon && d <= 2 && alpha > -_D / 2 && beta < _D / 2 {
             let ss = ss.unwrap_or_else(|| {
                 self.corrected_eval(
                     st,
@@ -2586,6 +2600,7 @@ impl Searcher {
             }
         }
         if allow_null
+            && !exact_terminal_horizon
             && ply > 0
             && d >= NULL_MOVE_MIN_DEPTH
             && d > 3
@@ -2738,6 +2753,7 @@ impl Searcher {
                 0
             };
             if _at
+                && !self.reaches_terminal_horizon(ply, d)
                 && ply > 0
                 && d <= 4
                 && _p >= 3 + d as usize * d as usize
@@ -3011,6 +3027,10 @@ impl Searcher {
         score
     }
     fn admit_depth(&self, d: u8, dp: u8, _i: u64, _cl: u64, _cq: u8) -> bool {
+        let terminal_limit = self.terminal_depth_limit();
+        if d > terminal_limit || dp >= terminal_limit {
+            return false;
+        }
         if let Some(limit) = self.fixed_depth {
             if !self.enforce_deadline {
                 return d <= limit && dp < limit;

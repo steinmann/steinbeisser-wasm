@@ -847,6 +847,74 @@ mod tests {
     }
 
     #[test]
+    fn search_depth_is_capped_by_remaining_max_turns() {
+        let mut session = SessionState::new();
+        session.turn_index = MAX_GAME_TURNS - 2;
+
+        let fixed = search_best_move_state(&session, 17).unwrap();
+        assert!(fixed.depth <= 2);
+
+        let timed = search_best_move_with_limits_state(&session, 0, Some(20)).unwrap();
+        assert!(timed.depth <= 2);
+    }
+
+    #[test]
+    fn core_search_stops_at_max_turn_horizon() {
+        let session = SessionState::new();
+        let gt = MAX_GAME_TURNS - 2;
+
+        let fixed = search_depth_with_gt(
+            &session.position,
+            &session.history_positions,
+            session.no_progress_ply,
+            gt,
+            17,
+            None,
+        )
+        .unwrap();
+        assert!(fixed.dp <= 2);
+
+        let timed = search_timed_with_gt(
+            &session.position,
+            &session.history_positions,
+            session.no_progress_ply,
+            gt,
+            20,
+            None,
+        )
+        .unwrap();
+        assert!(timed.dp <= 2);
+    }
+
+    #[test]
+    fn final_ply_search_returns_terminal_score() {
+        let position = Po::from_str("aba-v1;stm=b;black=A4,A5,B4,B5,B6,C5,C6,G2,G3;white=A1,A2,B1,B2,B3,C2,C3,G5,G6,H4,H5,H6,I4,I5").unwrap();
+
+        let result = search_depth_with_gt(&position, &[], 0, MAX_GAME_TURNS - 1, 17, None).unwrap();
+
+        assert_eq!(result.dp, 1);
+        assert!(
+            result.score.abs() >= _D - 1 || result.score == 0,
+            "expected terminal-class score at max-turn horizon, got {}",
+            result.score
+        );
+    }
+
+    #[test]
+    fn five_ply_horizon_search_returns_terminal_score() {
+        let position = Po::from_str("aba-v1;stm=b;black=A4,A5,B4,B5,B6,C5,C6,G2,G3;white=A1,A2,B1,B2,B3,C2,C3,G5,G6,H4,H5,H6,I4,I5").unwrap();
+
+        let result = search_depth_with_gt(&position, &[], 0, MAX_GAME_TURNS - 5, 17, None).unwrap();
+
+        assert_eq!(result.dp, 5);
+        assert!(
+            result.score.abs() >= _D - 5 || result.score == 0,
+            "expected terminal-class score at max-turn horizon, got {}",
+            result.score
+        );
+    }
+
+    #[test]
     fn disabling_all_search_limits_is_rejected() {
         let session = SessionState::new();
         let after_black = apply_move_state(session, "A5,B5,C5>SW").unwrap();

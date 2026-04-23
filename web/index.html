@@ -16,16 +16,22 @@
           <div class="eval-rail">
             <div class="eval-bar" aria-hidden="true">
               <div class="eval-fill" data-eval-fill></div>
+              <div class="eval-label" data-eval-label></div>
             </div>
-            <div class="ply-counter" data-ply-counter aria-live="polite"></div>
           </div>
-          <div class="board-frame" data-board></div>
+          <div class="board-stack">
+            <div class="board-frame" data-board></div>
+            <div class="thinking-dots board-thinking-dots" data-thinking-dots hidden aria-hidden="true">
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+          </div>
         </div>
       </section>
 
       <aside class="control-panel">
         <div class="control-group">
-          <button class="control-button" type="button" data-action="speed-test">Speed</button>
           <button class="control-button" type="button" data-action="demo">Demo</button>
           <button class="control-button" type="button" data-action="toggle-side">Play white</button>
           <button class="control-button" type="button" data-action="reset">Reset</button>
@@ -73,45 +79,58 @@
             <input
               class="setting-input"
               type="number"
-              min="1"
+              min="0.1"
               max="600"
-              step="1"
+              step="0.1"
               value="3"
               inputmode="numeric"
               data-setting="max-time-seconds"
             />
           </label>
+          <div class="setting-field debug-setting">
+            <span class="setting-header">
+              <span class="setting-label">Debug</span>
+              <button
+                class="toggle-switch"
+                type="button"
+                data-toggle="debug"
+                aria-pressed="true"
+                aria-label="Toggle debug"
+              >
+                <span class="toggle-thumb"></span>
+              </button>
+            </span>
+            <div class="debug-panel" data-debug-panel hidden>
+              <table class="debug-table" aria-label="Engine debug information">
+                <tbody>
+                  <tr>
+                    <th scope="row">Depth</th>
+                    <td data-debug-depth></td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Speed</th>
+                    <td data-debug-speed></td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Time</th>
+                    <td data-debug-time></td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Nodes</th>
+                    <td data-debug-nodes></td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Ply</th>
+                    <td data-debug-ply></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
 
         <div class="status-panel">
-          <div class="thinking-dots" data-thinking-dots hidden aria-hidden="true">
-            <span></span>
-            <span></span>
-            <span></span>
-          </div>
           <p class="search-info-text" data-search-info hidden></p>
-          <div class="speed-test-panel" data-speed-test-panel hidden>
-            <table class="speed-test-table" aria-label="Speed test results">
-              <tbody>
-                <tr>
-                  <th scope="row">Depth</th>
-                  <td data-speed-test-depth></td>
-                </tr>
-                <tr>
-                  <th scope="row">Speed</th>
-                  <td data-speed-test-speed></td>
-                </tr>
-                <tr>
-                  <th scope="row">Time</th>
-                  <td data-speed-test-time></td>
-                </tr>
-                <tr>
-                  <th scope="row">Nodes</th>
-                  <td data-speed-test-nodes></td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
           <p class="notice-text" data-notice></p>
         </div>
       </aside>

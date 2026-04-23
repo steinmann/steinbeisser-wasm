@@ -26,8 +26,9 @@ const DEFAULT_MAX_DEPTH = 17;
 const DEFAULT_MAX_TIME_SECONDS = 3;
 const MIN_MAX_DEPTH = 1;
 const MAX_MAX_DEPTH = 64;
-const MIN_MAX_TIME_SECONDS = 1;
+const MIN_MAX_TIME_SECONDS = 0.1;
 const MAX_MAX_TIME_SECONDS = 600;
+const MAX_TIME_STEP_SECONDS = 0.1;
 const EVAL_EXPECTED_OUTCOME_SCORE_SCALE = 996;
 
 const state = {
@@ -49,33 +50,35 @@ const state = {
   nextRequestId: 1,
   activeRequestId: null,
   lastEngineSearchInfo: null,
-  speedTestResult: null,
+  debugEnabled: true,
+  lastEngineDebugInfo: null,
   notice: '',
   noticeKind: null,
 };
 let initialSessionPosition = null;
 
 const boardContainer = document.querySelector('[data-board]');
-const plyCounterValue = document.querySelector('[data-ply-counter]');
 const evalRail = document.querySelector('.eval-rail');
 const evalBar = document.querySelector('.eval-bar');
 const evalFill = document.querySelector('[data-eval-fill]');
-const speedTestButton = document.querySelector('[data-action="speed-test"]');
+const evalLabel = document.querySelector('[data-eval-label]');
 const demoButton = document.querySelector('[data-action="demo"]');
 const toggleSideButton = document.querySelector('[data-action="toggle-side"]');
 const takeBackButton = document.querySelector('[data-action="takeback"]');
 const resetButton = document.querySelector('[data-action="reset"]');
 const depthLimitToggle = document.querySelector('[data-toggle="depth-limit"]');
 const timeLimitToggle = document.querySelector('[data-toggle="time-limit"]');
+const debugToggle = document.querySelector('[data-toggle="debug"]');
 const maxDepthInput = document.querySelector('[data-setting="max-depth"]');
 const maxTimeInput = document.querySelector('[data-setting="max-time-seconds"]');
 const thinkingDots = document.querySelector('[data-thinking-dots]');
 const searchInfoText = document.querySelector('[data-search-info]');
-const speedTestPanel = document.querySelector('[data-speed-test-panel]');
-const speedTestSpeed = document.querySelector('[data-speed-test-speed]');
-const speedTestTime = document.querySelector('[data-speed-test-time]');
-const speedTestNodes = document.querySelector('[data-speed-test-nodes]');
-const speedTestDepth = document.querySelector('[data-speed-test-depth]');
+const debugPanel = document.querySelector('[data-debug-panel]');
+const debugSpeed = document.querySelector('[data-debug-speed]');
+const debugTime = document.querySelector('[data-debug-time]');
+const debugNodes = document.querySelector('[data-debug-nodes]');
+const debugDepth = document.querySelector('[data-debug-depth]');
+const debugPly = document.querySelector('[data-debug-ply]');
 const noticeText = document.querySelector('[data-notice]');
 const frameTop = Math.min(...FRAME_POINTS.map(([, y]) => y));
 const frameLeftTip = FRAME_POINTS.reduce(
@@ -91,6 +94,20 @@ function clampInteger(value, fallback, minimum, maximum) {
     return fallback;
   }
   return Math.min(maximum, Math.max(minimum, parsed));
+}
+
+function clampNumber(value, fallback, minimum, maximum) {
+  const parsed = Number.parseFloat(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.min(maximum, Math.max(minimum, parsed));
+}
+
+function clampSteppedNumber(value, fallback, minimum, maximum, step) {
+  const clamped = clampNumber(value, fallback, minimum, maximum);
+  const stepped = Math.round(clamped / step) * step;
+  return Number(Math.min(maximum, Math.max(minimum, stepped)).toFixed(10));
 }
 
 function syncSearchInputs() {
@@ -144,12 +161,20 @@ function formatElapsedTime(elapsedMs) {
   return `${(Math.max(elapsedMs, 1) / 1000).toFixed(2)} s`;
 }
 
+function formatElapsedMilliseconds(elapsedMs) {
+  return `${Math.round(Math.max(elapsedMs, 1))} ms`;
+}
+
 function formatPlyCounter(turnIndex) {
   return `${turnIndex}/350`;
 }
 
 function clearSearchInfo() {
   state.lastEngineSearchInfo = null;
+}
+
+function clearDebugInfo() {
+  state.lastEngineDebugInfo = null;
 }
 
 function buildLastEngineSearchInfo(depth, elapsedMs) {
@@ -165,7 +190,6 @@ function buildLastEngineSearchInfo(depth, elapsedMs) {
 }
 
 function setNotice(text, kind = 'status') {
-  state.speedTestResult = null;
   state.notice = text;
   state.noticeKind = kind;
 }
@@ -176,8 +200,7 @@ function clearNotice() {
 }
 
 function clearTransientNotice() {
-  if (state.noticeKind === 'speed-test' || state.speedTestResult) {
-    state.speedTestResult = null;
+  if (state.noticeKind === 'status') {
     clearNotice();
   }
 }
@@ -206,6 +229,10 @@ function whiteExpectedOutcomeProbability(score) {
   return 1 / (1 + Math.exp(-scaled));
 }
 
+function formatWinProbability(probability) {
+  return `${Math.round(probability * 100)}%`;
+}
+
 function renderEvaluationBar(sessionStatus) {
   let whiteFraction;
   if (sessionStatus.result?.kind === 'win') {
@@ -216,6 +243,17 @@ function renderEvaluationBar(sessionStatus) {
     whiteFraction = whiteExpectedOutcomeProbability(effectiveWhiteScore(sessionStatus));
   }
   evalFill.style.height = `${whiteFraction * 100}%`;
+
+  if (Math.abs(whiteFraction - 0.5) < 0.005 || sessionStatus.result?.kind === 'draw') {
+    evalBar.dataset.leading = 'even';
+    evalLabel.textContent = formatWinProbability(0.5);
+  } else if (whiteFraction > 0.5) {
+    evalBar.dataset.leading = 'white';
+    evalLabel.textContent = formatWinProbability(whiteFraction);
+  } else {
+    evalBar.dataset.leading = 'black';
+    evalLabel.textContent = formatWinProbability(1 - whiteFraction);
+  }
 }
 
 function syncEvaluationBarGeometry() {
@@ -243,7 +281,6 @@ function render() {
   const status = session_status(state.session);
   const searchInFlight = state.activeRequestId !== null;
   const blockingSearch = isBlockingSearch();
-  const speedTestInFlight = state.activeSearchKind === 'speed-test';
   const locked =
     state.demoMode || blockingSearch || status.isGameOver || status.sideToMove !== state.humanColor;
   const showThinking =
@@ -262,27 +299,23 @@ function render() {
     onBackgroundClick: handleBoardBackgroundClick,
   });
 
-  if (plyCounterValue) {
-    plyCounterValue.textContent = formatPlyCounter(status.turnIndex);
-  }
   renderEvaluationBar(status);
   syncEvaluationBarGeometry();
-  speedTestButton.textContent = state.activeSearchKind === 'speed-test' ? 'Testing...' : 'Speed';
-  speedTestButton.disabled = speedTestInFlight || state.demoMode;
+  evalRail.classList.toggle('is-hidden', !state.debugEnabled);
   demoButton.textContent = state.demoMode ? 'Pause Demo' : 'Demo';
   demoButton.setAttribute('aria-pressed', state.demoMode ? 'true' : 'false');
-  demoButton.disabled = speedTestInFlight;
+  demoButton.disabled = false;
   toggleSideButton.textContent = state.humanColor === 'black' ? 'Play white' : 'Play black';
-  toggleSideButton.disabled = state.demoMode || state.activeSearchKind === 'speed-test';
-  takeBackButton.disabled = state.demoMode || speedTestInFlight || !status.canTakeBack;
-  resetButton.disabled =
-    state.demoMode || speedTestInFlight || state.session.position === initialSessionPosition;
+  toggleSideButton.disabled = state.demoMode;
+  takeBackButton.disabled = state.demoMode || !status.canTakeBack;
+  resetButton.disabled = state.demoMode || state.session.position === initialSessionPosition;
   depthLimitToggle.setAttribute('aria-pressed', state.depthLimitEnabled ? 'true' : 'false');
   timeLimitToggle.setAttribute('aria-pressed', state.timeLimitEnabled ? 'true' : 'false');
-  depthLimitToggle.disabled = state.demoMode || speedTestInFlight;
-  timeLimitToggle.disabled = state.demoMode || speedTestInFlight;
-  maxDepthInput.disabled = state.demoMode || speedTestInFlight;
-  maxTimeInput.disabled = state.demoMode || speedTestInFlight;
+  depthLimitToggle.disabled = state.demoMode;
+  timeLimitToggle.disabled = state.demoMode;
+  maxDepthInput.disabled = state.demoMode;
+  maxTimeInput.disabled = state.demoMode;
+  debugToggle.setAttribute('aria-pressed', state.debugEnabled ? 'true' : 'false');
   maxDepthInput.classList.toggle('is-inactive', !state.depthLimitEnabled);
   maxTimeInput.classList.toggle('is-inactive', !state.timeLimitEnabled);
   syncSearchInputs();
@@ -295,19 +328,22 @@ function render() {
   thinkingDots.hidden = !showThinking;
 
   const noticeValue = state.notice || (status.result ? resultCopy(status.result) : '');
-  const showSpeedTestResult = !noticeValue && !showThinking && !!state.speedTestResult;
+  const showDebugInfo = state.debugEnabled;
+  const debugInfo = state.lastEngineDebugInfo;
   const showSearchInfo = false;
-  speedTestPanel.hidden = !showSpeedTestResult;
-  if (showSpeedTestResult) {
-    speedTestSpeed.textContent = state.speedTestResult.speed;
-    speedTestTime.textContent = state.speedTestResult.time;
-    speedTestNodes.textContent = state.speedTestResult.nodes;
-    speedTestDepth.textContent = state.speedTestResult.depth;
+  debugPanel.hidden = !showDebugInfo;
+  if (showDebugInfo) {
+    debugSpeed.textContent = debugInfo?.speed ?? '';
+    debugTime.textContent = debugInfo?.time ?? '';
+    debugNodes.textContent = debugInfo?.nodes ?? '';
+    debugDepth.textContent = debugInfo?.depth ?? '';
+    debugPly.textContent = debugInfo?.ply ?? '';
   } else {
-    speedTestSpeed.textContent = '';
-    speedTestTime.textContent = '';
-    speedTestNodes.textContent = '';
-    speedTestDepth.textContent = '';
+    debugSpeed.textContent = '';
+    debugTime.textContent = '';
+    debugNodes.textContent = '';
+    debugDepth.textContent = '';
+    debugPly.textContent = '';
   }
 
   searchInfoText.hidden = !showSearchInfo;
@@ -402,28 +438,25 @@ function handleWorkerMessage(event) {
     if (message.requestId !== state.activeRequestId) {
       return;
     }
-    const requestKind = state.activeSearchKind;
     state.activeRequestId = null;
     state.activeSearchKind = null;
     state.thinking = false;
     state.thinkingSide = null;
-    if (requestKind === 'speed-test') {
-      state.speedTestResult = {
-        speed: formatNps(message.result.nodes, message.elapsedMs ?? 0),
-        time: formatElapsedTime(message.elapsedMs ?? 0),
-        nodes: message.result.nodes.toLocaleString(),
-        depth: String(message.result.depth),
-      };
-      clearNotice();
-      render();
-      return;
-    }
+    const elapsedMs = message.elapsedMs ?? 0;
     state.lastEngineSearchInfo = buildLastEngineSearchInfo(
       message.result.depth,
-      message.elapsedMs ?? 0,
+      elapsedMs,
     );
     state.evaluationWhiteScore = message.result.whitePerspectiveScore;
     state.session = apply_move(state.session, message.result.bestMove);
+    const statusAfterMove = session_status(state.session);
+    state.lastEngineDebugInfo = {
+      depth: `${message.result.depth} ply`,
+      speed: formatNps(message.result.nodes, elapsedMs),
+      time: formatElapsedMilliseconds(elapsedMs),
+      nodes: message.result.nodes.toLocaleString(),
+      ply: formatPlyCounter(statusAfterMove.turnIndex),
+    };
     clearNotice();
     render();
     void maybeStartDemoTurn();
@@ -440,12 +473,7 @@ function handleWorkerMessage(event) {
     state.thinkingSide = null;
     state.demoMode = false;
     clearSearchInfo();
-    setNotice(
-      message.kind === 'speed-test'
-        ? message.error || 'Speed test failed'
-        : message.error || 'Search failed',
-      message.kind === 'speed-test' ? 'speed-test' : 'error',
-    );
+    setNotice(message.error || 'Search failed', 'error');
     render();
   }
 }
@@ -503,7 +531,7 @@ async function beginEngineTurn() {
     return;
   }
   const maxDepth = state.depthLimitEnabled ? state.maxDepth : 0;
-  const maxTimeMs = state.timeLimitEnabled ? state.maxTimeSeconds * 1000 : 0;
+  const maxTimeMs = state.timeLimitEnabled ? Math.round(state.maxTimeSeconds * 1000) : 0;
 
   const requestId = state.nextRequestId;
   state.nextRequestId += 1;
@@ -535,41 +563,6 @@ async function ensureEngineTurnIfNeeded() {
   await beginEngineTurn();
 }
 
-async function runSpeedTest() {
-  if (state.thinking || state.demoMode) {
-    return;
-  }
-  clearTransientNotice();
-
-  const status = session_status(state.session);
-  if (status.isGameOver) {
-    setNotice('Speed test unavailable in a finished game', 'speed-test');
-    render();
-    return;
-  }
-
-  const requestId = state.nextRequestId;
-  state.nextRequestId += 1;
-  state.activeRequestId = requestId;
-  state.activeSearchKind = 'speed-test';
-  state.thinking = true;
-  state.thinkingSide = status.sideToMove;
-  clearNotice();
-  render();
-  await ensureWorkerReady();
-  if (state.activeRequestId !== requestId || state.activeSearchKind !== 'speed-test') {
-    return;
-  }
-  state.worker.postMessage({
-    type: 'search',
-    kind: 'speed-test',
-    requestId,
-    maxDepth: state.maxDepth,
-    maxTimeMs: 0,
-    session: state.session,
-  });
-}
-
 async function maybeStartDemoTurn() {
   const status = session_status(state.session);
   if (!state.demoMode || state.thinking || status.isGameOver) {
@@ -582,6 +575,7 @@ async function resetBoardState() {
   state.session = new_session();
   clearSelection();
   clearSearchInfo();
+  clearDebugInfo();
   state.evaluationWhiteScore = 0;
   clearNotice();
   render();
@@ -606,12 +600,9 @@ demoButton.addEventListener('click', async () => {
   await maybeStartDemoTurn();
 });
 
-speedTestButton.addEventListener('click', async () => {
-  if (state.activeRequestId !== null || state.demoMode) {
-    return;
-  }
-  clearTransientNotice();
-  await runSpeedTest();
+debugToggle.addEventListener('click', () => {
+  state.debugEnabled = !state.debugEnabled;
+  render();
 });
 
 toggleSideButton.addEventListener('click', async () => {
@@ -656,11 +647,12 @@ maxDepthInput.addEventListener('change', async () => {
 
 maxTimeInput.addEventListener('change', async () => {
   clearTransientNotice();
-  state.maxTimeSeconds = clampInteger(
+  state.maxTimeSeconds = clampSteppedNumber(
     maxTimeInput.value,
     DEFAULT_MAX_TIME_SECONDS,
     MIN_MAX_TIME_SECONDS,
     MAX_MAX_TIME_SECONDS,
+    MAX_TIME_STEP_SECONDS,
   );
   syncSearchInputs();
   render();
@@ -675,6 +667,7 @@ takeBackButton.addEventListener('click', async () => {
     state.session = undo_full_turn(state.session);
     clearSelection();
     clearSearchInfo();
+    clearDebugInfo();
     state.evaluationWhiteScore = 0;
     clearNotice();
     render();
