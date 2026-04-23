@@ -269,7 +269,7 @@ function render() {
   syncEvaluationBarGeometry();
   speedTestButton.textContent = state.activeSearchKind === 'speed-test' ? 'Testing...' : 'Speed';
   speedTestButton.disabled = speedTestInFlight || state.demoMode;
-  demoButton.textContent = state.demoMode ? 'Stop Demo' : 'Demo';
+  demoButton.textContent = state.demoMode ? 'Pause Demo' : 'Demo';
   demoButton.setAttribute('aria-pressed', state.demoMode ? 'true' : 'false');
   demoButton.disabled = speedTestInFlight;
   toggleSideButton.textContent = state.humanColor === 'black' ? 'Play white' : 'Play black';
@@ -595,7 +595,8 @@ demoButton.addEventListener('click', async () => {
     if (state.activeRequestId !== null) {
       await cancelSearch();
     }
-    await resetBoardState();
+    clearSearchInfo();
+    render();
     return;
   }
 
