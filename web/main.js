@@ -15,6 +15,7 @@ const {
 } = engineModule;
 
 const {
+  CELLS,
   FRAME_POINTS,
   VIEWBOX,
   occupantAt,
@@ -30,6 +31,8 @@ const MIN_MAX_TIME_SECONDS = 0.1;
 const MAX_MAX_TIME_SECONDS = 600;
 const MAX_TIME_STEP_SECONDS = 0.1;
 const EVAL_EXPECTED_OUTCOME_SCORE_SCALE = 996;
+const MAX_MARBLES_PER_SIDE = 14;
+const CELL_ORDER = new Map(CELLS.map((cell, index) => [cell.coord, index]));
 
 const state = {
   session: null,
@@ -41,6 +44,7 @@ const state = {
   timeLimitEnabled: true,
   maxDepth: DEFAULT_MAX_DEPTH,
   maxTimeSeconds: DEFAULT_MAX_TIME_SECONDS,
+  editMode: false,
   demoMode: false,
   thinking: false,
   thinkingSide: null,
@@ -65,6 +69,9 @@ const evalLabel = document.querySelector('[data-eval-label]');
 const demoButton = document.querySelector('[data-action="demo"]');
 const toggleSideButton = document.querySelector('[data-action="toggle-side"]');
 const takeBackButton = document.querySelector('[data-action="takeback"]');
+const editPositionButton = document.querySelector('[data-action="edit-position"]');
+const positionEditor = document.querySelector('[data-position-editor]');
+const positionInput = document.querySelector('[data-position-input]');
 const resetButton = document.querySelector('[data-action="reset"]');
 const depthLimitToggle = document.querySelector('[data-toggle="depth-limit"]');
 const timeLimitToggle = document.querySelector('[data-toggle="time-limit"]');
@@ -115,12 +122,229 @@ function syncSearchInputs() {
   maxTimeInput.value = String(state.maxTimeSeconds);
 }
 
+function sortCells(cells) {
+  return [...cells].sort((left, right) => CELL_ORDER.get(left) - CELL_ORDER.get(right));
+}
+
+function cellField(cells) {
+  const sorted = sortCells(cells);
+  return sorted.length ? sorted.join(',') : '-';
+}
+
+function serializePosition({ sideToMove, black, white }) {
+  return `aba-v1;stm=${sideToMove === 'white' ? 'w' : 'b'};black=${cellField(black)};white=${cellField(white)}`;
+}
+
+function compressFenRow(values) {
+  let row = '';
+  let emptyCount = 0;
+  for (const value of values) {
+    if (!value) {
+      emptyCount += 1;
+      continue;
+    }
+    if (emptyCount) {
+      row += String(emptyCount);
+      emptyCount = 0;
+    }
+    row += value;
+  }
+  if (emptyCount) {
+    row += String(emptyCount);
+  }
+  return row;
+}
+
+function serializePlayStrategyFen(positionState) {
+  const rows = [];
+  for (let rowIndex = 0; rowIndex < 9; rowIndex += 1) {
+    const rowCells = CELLS.filter((cell) => cell.rowIndex === rowIndex);
+    rows.push(
+      compressFenRow(
+        rowCells.map((cell) => {
+          const occupant = occupantAt(positionState, cell.coord);
+          if (occupant === 'black') {
+            return 'S';
+          }
+          if (occupant === 'white') {
+            return 's';
+          }
+          return '';
+        }),
+      ),
+    );
+  }
+
+  const whiteEjected = Math.max(0, MAX_MARBLES_PER_SIDE - positionState.white.size);
+  const blackEjected = Math.max(0, MAX_MARBLES_PER_SIDE - positionState.black.size);
+  const side = positionState.sideToMove === 'white' ? 'W' : 'B';
+  return `${rows.join('/')} 0 0 ${side} ${whiteEjected} ${blackEjected}`;
+}
+
+function editedResult(positionState, turnIndex) {
+  if (positionState.black.size <= 8) {
+    return {
+      kind: 'win',
+      winner: 'white',
+      reason: 'black_marbles_reduced_to_eight',
+    };
+  }
+  if (positionState.white.size <= 8) {
+    return {
+      kind: 'win',
+      winner: 'black',
+      reason: 'white_marbles_reduced_to_eight',
+    };
+  }
+  if (turnIndex >= 350) {
+    if (positionState.black.size > positionState.white.size) {
+      return {
+        kind: 'win',
+        winner: 'black',
+        reason: 'max_turns_material_advantage',
+      };
+    }
+    if (positionState.white.size > positionState.black.size) {
+      return {
+        kind: 'win',
+        winner: 'white',
+        reason: 'max_turns_material_advantage',
+      };
+    }
+    return {
+      kind: 'draw',
+      winner: null,
+      reason: 'max_turns_even_material',
+    };
+  }
+  return null;
+}
+
+function sessionFromPosition(position, turnIndex = 0) {
+  const positionState = parsePositionString(position);
+  const session = {
+    position,
+    sideToMove: positionState.sideToMove,
+    historyPositions: [],
+    noProgressPly: 0,
+    turnIndex,
+    lastEngineReverseMove: null,
+    moveStack: [],
+    blackCount: positionState.black.size,
+    whiteCount: positionState.white.size,
+    lastMove: null,
+    result: editedResult(positionState, turnIndex),
+  };
+  session_status(session);
+  return session;
+}
+
+function parseAbaPosition(value) {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('aba-v1;')) {
+    return null;
+  }
+  const positionState = parsePositionString(trimmed);
+  return serializePosition(positionState);
+}
+
+function expandFenRow(rawRow) {
+  const expanded = [];
+  let index = 0;
+  while (index < rawRow.length) {
+    const char = rawRow[index];
+    if (/\d/.test(char)) {
+      let digits = char;
+      index += 1;
+      while (index < rawRow.length && /\d/.test(rawRow[index])) {
+        digits += rawRow[index];
+        index += 1;
+      }
+      for (let count = Number.parseInt(digits, 10); count > 0; count -= 1) {
+        expanded.push(null);
+      }
+      continue;
+    }
+    if (char === 's' || char === 'S') {
+      expanded.push(char === 'S' ? 'black' : 'white');
+      index += 1;
+      continue;
+    }
+    throw new Error(`Unsupported FEN cell "${char}"`);
+  }
+  return expanded;
+}
+
+function parsePlayStrategyFen(value) {
+  const tokens = value.trim().split(/\s+/).filter(Boolean);
+  const boardToken = tokens[0];
+  if (!boardToken || !boardToken.includes('/')) {
+    return null;
+  }
+
+  const rows = boardToken.split('/');
+  if (rows.length !== 9) {
+    throw new Error('FEN needs 9 board rows');
+  }
+
+  const black = [];
+  const white = [];
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    const rowCells = CELLS.filter((cell) => cell.rowIndex === rowIndex);
+    const expanded = expandFenRow(rows[rowIndex]);
+    if (expanded.length !== rowCells.length) {
+      throw new Error(`FEN row ${rowIndex + 1} has ${expanded.length} cells, expected ${rowCells.length}`);
+    }
+    for (let columnIndex = 0; columnIndex < expanded.length; columnIndex += 1) {
+      if (expanded[columnIndex] === 'black') {
+        black.push(rowCells[columnIndex].coord);
+      } else if (expanded[columnIndex] === 'white') {
+        white.push(rowCells[columnIndex].coord);
+      }
+    }
+  }
+
+  const sideToken = tokens.find((token) => /^[bw]$/i.test(token));
+  const sideToMove =
+    sideToken?.toLowerCase() === 'w'
+      ? 'white'
+      : sideToken?.toLowerCase() === 'b'
+        ? 'black'
+        : parsePositionString(state.session.position).sideToMove;
+
+  return serializePosition({ sideToMove, black, white });
+}
+
+function parsePastedPosition(value) {
+  const abaPosition = parseAbaPosition(value);
+  if (abaPosition) {
+    return abaPosition;
+  }
+  const fenPosition = parsePlayStrategyFen(value);
+  if (fenPosition) {
+    return fenPosition;
+  }
+  throw new Error('Paste an aba-v1 position or PlayStrategy FEN');
+}
+
+function refreshPositionInput() {
+  if (!state.session) {
+    positionInput.value = '';
+    return;
+  }
+  positionInput.value = serializePlayStrategyFen(parsePositionString(state.session.position));
+  requestAnimationFrame(() => {
+    positionInput.scrollLeft = 0;
+  });
+}
+
 function engineColor() {
   return state.humanColor === 'black' ? 'white' : 'black';
 }
 
 function canHumanAct(status) {
   return (
+    !state.editMode &&
     !state.demoMode &&
     !isBlockingSearch() &&
     !status.isGameOver &&
@@ -282,7 +506,11 @@ function render() {
   const searchInFlight = state.activeRequestId !== null;
   const blockingSearch = isBlockingSearch();
   const locked =
-    state.demoMode || blockingSearch || status.isGameOver || status.sideToMove !== state.humanColor;
+    state.editMode ||
+    state.demoMode ||
+    blockingSearch ||
+    status.isGameOver ||
+    status.sideToMove !== state.humanColor;
   const showThinking =
     searchInFlight &&
     !status.result &&
@@ -297,6 +525,8 @@ function render() {
     onCellClick: handleCellClick,
     onCandidateClick: handleCandidateClick,
     onBackgroundClick: handleBoardBackgroundClick,
+    editMode: state.editMode,
+    onEditDrop: handleEditDrop,
   });
 
   renderEvaluationBar(status);
@@ -304,11 +534,15 @@ function render() {
   evalRail.classList.toggle('is-hidden', !state.debugEnabled);
   demoButton.textContent = state.demoMode ? 'Pause self-play' : 'Self-play';
   demoButton.setAttribute('aria-pressed', state.demoMode ? 'true' : 'false');
-  demoButton.disabled = false;
+  demoButton.disabled = state.editMode;
   toggleSideButton.textContent = state.humanColor === 'black' ? 'Play white' : 'Play black';
-  toggleSideButton.disabled = state.demoMode;
-  takeBackButton.disabled = state.demoMode || !status.canTakeBack;
+  toggleSideButton.disabled = state.editMode || state.demoMode;
+  takeBackButton.disabled = state.editMode || state.demoMode || !status.canTakeBack;
   resetButton.disabled = state.demoMode || state.session.position === initialSessionPosition;
+  editPositionButton.textContent = state.editMode ? 'Done' : 'Edit';
+  editPositionButton.setAttribute('aria-pressed', state.editMode ? 'true' : 'false');
+  editPositionButton.disabled = false;
+  positionEditor.hidden = !state.editMode;
   depthLimitToggle.setAttribute('aria-pressed', state.depthLimitEnabled ? 'true' : 'false');
   timeLimitToggle.setAttribute('aria-pressed', state.timeLimitEnabled ? 'true' : 'false');
   depthLimitToggle.disabled = state.demoMode;
@@ -359,6 +593,69 @@ function refreshCandidates() {
     return;
   }
   state.candidates = legal_moves_for_selection(state.session, state.selected);
+}
+
+function setEditedPosition(positionState) {
+  const position = serializePosition(positionState);
+  state.session = sessionFromPosition(position, state.session.turnIndex);
+  clearSelection();
+  clearSearchInfo();
+  clearDebugInfo();
+  state.evaluationWhiteScore = 0;
+  clearNotice();
+}
+
+function handleEditDrop(payload, targetCoord) {
+  if (!state.editMode) {
+    return;
+  }
+
+  const positionState = parsePositionString(state.session.position);
+  const sourceSet = payload.color === 'black' ? positionState.black : positionState.white;
+
+  if (payload.source === 'board') {
+    if (payload.coord === targetCoord) {
+      return;
+    }
+    sourceSet.delete(payload.coord);
+  } else if (!targetCoord) {
+    return;
+  }
+
+  if (targetCoord) {
+    positionState.black.delete(targetCoord);
+    positionState.white.delete(targetCoord);
+    sourceSet.add(targetCoord);
+  }
+
+  setEditedPosition(positionState);
+  refreshPositionInput();
+  render();
+}
+
+function applyPositionText() {
+  const value = positionInput.value.trim();
+  if (!value) {
+    refreshPositionInput();
+    return true;
+  }
+
+  try {
+    const position = parsePastedPosition(value);
+    state.session = sessionFromPosition(position, state.session.turnIndex);
+    clearSelection();
+    clearSearchInfo();
+    clearDebugInfo();
+    state.evaluationWhiteScore = 0;
+    clearNotice();
+    refreshPositionInput();
+    render();
+    return true;
+  } catch (error) {
+    setNotice(error.message || String(error), 'error');
+    render();
+    return false;
+  }
 }
 
 function handleBoardBackgroundClick() {
@@ -582,6 +879,32 @@ async function resetBoardState() {
   await ensureEngineTurnIfNeeded();
 }
 
+editPositionButton.addEventListener('click', async () => {
+  clearTransientNotice();
+  if (!state.editMode) {
+    state.demoMode = false;
+    if (state.activeRequestId !== null) {
+      await cancelSearch();
+    }
+    state.editMode = true;
+    clearSelection();
+    clearSearchInfo();
+    refreshPositionInput();
+    render();
+    positionInput.focus();
+    positionInput.select();
+    return;
+  }
+
+  if (!applyPositionText()) {
+    return;
+  }
+  state.editMode = false;
+  clearSelection();
+  render();
+  await ensureEngineTurnIfNeeded();
+});
+
 demoButton.addEventListener('click', async () => {
   clearTransientNotice();
   if (state.demoMode) {
@@ -682,11 +1005,22 @@ takeBackButton.addEventListener('click', async () => {
 resetButton.addEventListener('click', async () => {
   clearTransientNotice();
   state.demoMode = false;
+  state.editMode = false;
   if (state.activeRequestId !== null) {
     await cancelSearch();
   }
   await resetBoardState();
 });
+
+positionInput.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter') {
+    return;
+  }
+  event.preventDefault();
+  applyPositionText();
+});
+
+positionInput.addEventListener('change', applyPositionText);
 
 await initEngine({ module_or_path: wasmModulePath });
 state.session = new_session();

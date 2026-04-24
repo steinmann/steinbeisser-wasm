@@ -317,6 +317,59 @@ body {
   margin-top: 20px;
 }
 
+.position-editor {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.position-editor[hidden] {
+  display: none !important;
+}
+
+.fen-label {
+  flex: 0 0 auto;
+  color: #aeb7c7;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.fen-input {
+  appearance: none;
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+  border: 1px solid #505b73;
+  border-radius: 6px;
+  background: #222733;
+  color: #e6ebf2;
+  padding: 10px 12px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.3;
+  outline: none;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.fen-input:hover,
+.fen-input:focus-visible {
+  background: #293140;
+  border-color: #5f6d87;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .status-panel {
   align-items: center;
   justify-content: flex-start;

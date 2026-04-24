@@ -36,6 +36,18 @@
           <button class="control-button" type="button" data-action="toggle-side">Play white</button>
           <button class="control-button" type="button" data-action="reset">Reset</button>
           <button class="control-button" type="button" data-action="takeback">Take back</button>
+          <button class="control-button" type="button" data-action="edit-position">Edit</button>
+          <label class="position-editor" data-position-editor hidden>
+            <span class="fen-label">FEN</span>
+            <input
+              class="fen-input"
+              type="text"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="Paste FEN"
+              data-position-input
+            />
+          </label>
         </div>
 
         <div class="control-group search-settings">

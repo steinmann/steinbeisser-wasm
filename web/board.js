@@ -50,21 +50,61 @@ const DIRECTION_AXIAL = {
   NE: [1, -1],
 };
 
-const DIRECTION_SCREEN = {
-  E: [157, 0],
-  SE: [78.5, 135],
-  SW: [-78.5, 135],
-  W: [-157, 0],
-  NW: [-78.5, -135],
-  NE: [78.5, -135],
-};
-
 function svg(tag, attrs = {}) {
   const node = document.createElementNS(SVG_NS, tag);
   for (const [key, value] of Object.entries(attrs)) {
     node.setAttribute(key, String(value));
   }
   return node;
+}
+
+function marbleRadii(color, captured = false) {
+  if (color === 'black') {
+    return {
+      outer: captured ? BLACK_CAPTURE_OUTER_RADIUS : BLACK_PIECE_OUTER_RADIUS,
+      inner: captured ? BLACK_CAPTURE_INNER_RADIUS : BLACK_PIECE_INNER_RADIUS,
+    };
+  }
+  return {
+    outer: captured ? WHITE_CAPTURE_OUTER_RADIUS : WHITE_PIECE_OUTER_RADIUS,
+    inner: captured ? WHITE_CAPTURE_INNER_RADIUS : WHITE_PIECE_INNER_RADIUS,
+  };
+}
+
+function marbleFills(color) {
+  return color === 'black'
+    ? { outer: COLORS.blackOuter, inner: COLORS.blackInner }
+    : { outer: COLORS.whiteOuter, inner: COLORS.whiteInner };
+}
+
+function createMarble(color, x, y, { captured = false, draggable = false } = {}) {
+  const radii = marbleRadii(color, captured);
+  const fills = marbleFills(color);
+  const marbleGroup = svg('g', {
+    transform: `translate(${x} ${y})`,
+    'pointer-events': draggable ? 'all' : 'none',
+  });
+  if (draggable) {
+    marbleGroup.style.cursor = 'grab';
+    marbleGroup.setAttribute('tabindex', '0');
+  }
+  marbleGroup.append(
+    svg('circle', {
+      cx: 0,
+      cy: 0,
+      r: radii.outer,
+      fill: fills.outer,
+    }),
+  );
+  marbleGroup.append(
+    svg('circle', {
+      cx: 0,
+      cy: 0,
+      r: radii.inner,
+      fill: fills.inner,
+    }),
+  );
+  return marbleGroup;
 }
 
 function buildCells() {
@@ -185,12 +225,6 @@ export function translateCoord(coord, direction) {
   return AXIAL_KEY_TO_COORD.get(key) ?? null;
 }
 
-function normalizedDirectionVector(direction) {
-  const [dx, dy] = DIRECTION_SCREEN[direction] ?? [0, 0];
-  const length = Math.hypot(dx, dy) || 1;
-  return { x: dx / length, y: dy / length };
-}
-
 function hexDistance(left, right) {
   return Math.max(
     Math.abs(left.axial.q - right.axial.q),
@@ -229,17 +263,28 @@ function broadsideDestinationPoint(candidate, selectedCoord) {
   return destinationCell ? { x: destinationCell.x, y: destinationCell.y } : null;
 }
 
+function inlinePushLandingPoint(candidate) {
+  const sourceSet = new Set(candidate.sourceCells);
+  const frontSource = candidate.sourceCells.find((coord) => {
+    const nextCoord = translateCoord(coord, candidate.direction);
+    return !nextCoord || !sourceSet.has(nextCoord);
+  });
+
+  if (!frontSource) {
+    return null;
+  }
+
+  const landingCoord = translateCoord(frontSource, candidate.direction);
+  const landingCell = landingCoord ? CELL_MAP.get(landingCoord) : null;
+  return landingCell ? { x: landingCell.x, y: landingCell.y } : null;
+}
+
 export function candidateDotPoint(candidate, selected = []) {
-  if (candidate.isEjection) {
-    const anchor = CELL_MAP.get(candidate.anchorCell);
-    if (!anchor) {
-      return { x: 0, y: 0 };
+  if (candidate.isEjection || (candidate.isInline && candidate.isPush)) {
+    const landingPoint = inlinePushLandingPoint(candidate);
+    if (landingPoint) {
+      return landingPoint;
     }
-    const unit = normalizedDirectionVector(candidate.direction);
-    return {
-      x: anchor.x + (unit.x * SLOT_RADIUS),
-      y: anchor.y + (unit.y * SLOT_RADIUS),
-    };
   }
 
   const selectedCoord = selected.length === 1 ? selected[0] : null;
@@ -306,106 +351,82 @@ function appendSlotLayer(group, positionState) {
   }
 }
 
-function appendPieces(group, positionState) {
+function appendPieces(group, positionState, editMode, onDragStart) {
   for (const cell of CELLS) {
     const occupant = occupantAt(positionState, cell.coord);
     if (!occupant) {
       continue;
     }
-    const outerFill = occupant === 'black' ? COLORS.blackOuter : COLORS.whiteOuter;
-    const innerFill = occupant === 'black' ? COLORS.blackInner : COLORS.whiteInner;
-    const outerRadius =
-      occupant === 'black' ? BLACK_PIECE_OUTER_RADIUS : WHITE_PIECE_OUTER_RADIUS;
-    const innerRadius =
-      occupant === 'black' ? BLACK_PIECE_INNER_RADIUS : WHITE_PIECE_INNER_RADIUS;
-
-    const marbleGroup = svg('g');
-    marbleGroup.append(
-      svg('circle', {
-        cx: cell.x,
-        cy: cell.y,
-        r: outerRadius,
-        fill: outerFill,
-      }),
-    );
-    marbleGroup.append(
-      svg('circle', {
-        cx: cell.x,
-        cy: cell.y,
-        r: innerRadius,
-        fill: innerFill,
-      }),
-    );
+    const marbleGroup = createMarble(occupant, cell.x, cell.y, { draggable: editMode });
+    if (editMode) {
+      marbleGroup.addEventListener('pointerdown', (event) => {
+        onDragStart(event, {
+          source: 'board',
+          color: occupant,
+          coord: cell.coord,
+        });
+      });
+    }
     group.append(marbleGroup);
   }
 }
 
-function appendCapturedPieces(group, session) {
+function appendCapturedPieces(group, session, editMode, onDragStart) {
   const missingBlack = Math.max(0, MAX_MARBLES_PER_SIDE - (session.blackCount ?? MAX_MARBLES_PER_SIDE));
   const missingWhite = Math.max(0, MAX_MARBLES_PER_SIDE - (session.whiteCount ?? MAX_MARBLES_PER_SIDE));
 
   const whiteCaptureXs = CAPTURE_XS.slice(0, missingWhite);
   const blackCaptureXs = CAPTURE_XS.slice(CAPTURE_XS.length - missingBlack);
 
-  for (const x of whiteCaptureXs) {
-    const marbleGroup = svg('g', { 'pointer-events': 'none' });
-    marbleGroup.append(
-      svg('circle', {
-        cx: x,
-        cy: WHITE_CAPTURE_Y,
-        r: WHITE_CAPTURE_OUTER_RADIUS,
-        fill: COLORS.whiteOuter,
-      }),
-    );
-    marbleGroup.append(
-      svg('circle', {
-        cx: x,
-        cy: WHITE_CAPTURE_Y,
-        r: WHITE_CAPTURE_INNER_RADIUS,
-        fill: COLORS.whiteInner,
-      }),
-    );
+  for (const [index, x] of whiteCaptureXs.entries()) {
+    const marbleGroup = createMarble('white', x, WHITE_CAPTURE_Y, {
+      captured: true,
+      draggable: editMode,
+    });
+    if (editMode) {
+      marbleGroup.addEventListener('pointerdown', (event) => {
+        onDragStart(event, {
+          source: 'captured',
+          color: 'white',
+          index,
+        });
+      });
+    }
     group.append(marbleGroup);
   }
 
-  for (const x of blackCaptureXs) {
-    const marbleGroup = svg('g', { 'pointer-events': 'none' });
-    marbleGroup.append(
-      svg('circle', {
-        cx: x,
-        cy: BLACK_CAPTURE_Y,
-        r: BLACK_CAPTURE_OUTER_RADIUS,
-        fill: COLORS.blackOuter,
-      }),
-    );
-    marbleGroup.append(
-      svg('circle', {
-        cx: x,
-        cy: BLACK_CAPTURE_Y,
-        r: BLACK_CAPTURE_INNER_RADIUS,
-        fill: COLORS.blackInner,
-      }),
-    );
+  for (const [index, x] of blackCaptureXs.entries()) {
+    const marbleGroup = createMarble('black', x, BLACK_CAPTURE_Y, {
+      captured: true,
+      draggable: editMode,
+    });
+    if (editMode) {
+      marbleGroup.addEventListener('pointerdown', (event) => {
+        onDragStart(event, {
+          source: 'captured',
+          color: 'black',
+          index,
+        });
+      });
+    }
     group.append(marbleGroup);
   }
 }
 
 function appendSelectionMarkers(group, selected) {
-  for (const coord of selected) {
-    const cell = CELL_MAP.get(coord);
-    if (!cell) {
-      continue;
-    }
-    group.append(
-      svg('circle', {
-        cx: cell.x,
-        cy: cell.y,
-        r: 23,
-        fill: COLORS.accent,
-        'pointer-events': 'none',
-      }),
-    );
+  const cell = selected.length ? CELL_MAP.get(selected[0]) : null;
+  if (!cell) {
+    return;
   }
+  group.append(
+    svg('circle', {
+      cx: cell.x,
+      cy: cell.y,
+      r: 23,
+      fill: COLORS.accent,
+      'pointer-events': 'none',
+    }),
+  );
 }
 
 function appendCandidateDots(group, candidates, selected, onCandidateClick) {
@@ -484,6 +505,26 @@ function appendHitTargets(group, onCellClick, locked) {
   }
 }
 
+function svgPointFromEvent(svgRoot, event) {
+  const point = svgRoot.createSVGPoint();
+  point.x = event.clientX;
+  point.y = event.clientY;
+  return point.matrixTransform(svgRoot.getScreenCTM().inverse());
+}
+
+function nearestDropCell(point) {
+  let nearest = null;
+  let nearestDistance = Infinity;
+  for (const cell of CELLS) {
+    const distance = Math.hypot(cell.x - point.x, cell.y - point.y);
+    if (distance < nearestDistance) {
+      nearest = cell;
+      nearestDistance = distance;
+    }
+  }
+  return nearestDistance <= SLOT_RADIUS ? nearest : null;
+}
+
 export function renderBoard({
   container,
   session,
@@ -493,16 +534,21 @@ export function renderBoard({
   onCandidateClick,
   onBackgroundClick,
   locked,
+  editMode = false,
+  onEditDrop = () => {},
 }) {
   container.textContent = '';
   const positionState = parsePositionString(session.position);
+  let drag = null;
 
   const svgRoot = svg('svg', {
     viewBox: `${VIEWBOX.minX} ${VIEWBOX.minY} ${VIEWBOX.width} ${VIEWBOX.height}`,
     class: 'board-svg',
     'aria-label': 'Abalone board',
   });
-  svgRoot.addEventListener('click', () => onBackgroundClick());
+  if (!editMode) {
+    svgRoot.addEventListener('click', () => onBackgroundClick());
+  }
 
   svgRoot.append(
     svg('rect', {
@@ -515,7 +561,62 @@ export function renderBoard({
   );
 
   const capturedPieces = svg('g');
-  appendCapturedPieces(capturedPieces, session);
+  const dragLayer = svg('g');
+
+  const beginEditDrag = (event, payload) => {
+    if (!editMode || event.button !== 0) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const point = svgPointFromEvent(svgRoot, event);
+    const ghost = createMarble(payload.color, point.x, point.y, {
+      captured: false,
+      draggable: false,
+    });
+    ghost.setAttribute('opacity', '0.82');
+    dragLayer.append(ghost);
+    drag = {
+      payload,
+      ghost,
+      pointerId: event.pointerId,
+    };
+    svgRoot.setPointerCapture(event.pointerId);
+  };
+
+  const moveEditDrag = (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+    event.preventDefault();
+    const point = svgPointFromEvent(svgRoot, event);
+    drag.ghost.setAttribute('transform', `translate(${point.x} ${point.y})`);
+  };
+
+  const finishEditDrag = (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const point = svgPointFromEvent(svgRoot, event);
+    const targetCell = nearestDropCell(point);
+    const payload = drag.payload;
+    drag.ghost.remove();
+    drag = null;
+    if (svgRoot.hasPointerCapture(event.pointerId)) {
+      svgRoot.releasePointerCapture(event.pointerId);
+    }
+    onEditDrop(payload, targetCell?.coord ?? null);
+  };
+
+  if (editMode) {
+    svgRoot.addEventListener('pointermove', moveEditDrag);
+    svgRoot.addEventListener('pointerup', finishEditDrag);
+    svgRoot.addEventListener('pointercancel', finishEditDrag);
+  }
+
+  appendCapturedPieces(capturedPieces, session, editMode, beginEditDrag);
   svgRoot.append(capturedPieces);
 
   svgRoot.append(
@@ -533,7 +634,7 @@ export function renderBoard({
   svgRoot.append(slots);
 
   const pieces = svg('g');
-  appendPieces(pieces, positionState);
+  appendPieces(pieces, positionState, editMode, beginEditDrag);
   svgRoot.append(pieces);
 
   const hits = svg('g');
@@ -541,9 +642,12 @@ export function renderBoard({
   svgRoot.append(hits);
 
   const overlay = svg('g');
-  appendSelectionMarkers(overlay, selected);
-  appendCandidateDots(overlay, candidates, selected, onCandidateClick);
+  if (!editMode) {
+    appendSelectionMarkers(overlay, selected);
+    appendCandidateDots(overlay, candidates, selected, onCandidateClick);
+  }
   svgRoot.append(overlay);
+  svgRoot.append(dragLayer);
 
   container.append(svgRoot);
 }
