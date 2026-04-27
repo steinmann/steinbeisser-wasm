@@ -1,0 +1,2 @@
+[build]
+target-dir = "/tmp/steinbeisser-wasm-engine-target"

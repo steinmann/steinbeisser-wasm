@@ -4,13 +4,20 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE_DIR="${ROOT_DIR}/engine"
+WEB_DIR="${ROOT_DIR}/web"
 DIST_DIR="${ROOT_DIR}/dist"
 PKG_DIR="${DIST_DIR}/pkg"
 WASM_NAME="steinbeisser_wasm_engine"
 BUILD_ID="$(date -u +%Y%m%d%H%M%S)"
+TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/steinbeisser-wasm-engine-target}"
+
+if [[ "${TARGET_DIR}" != /* ]]; then
+  TARGET_DIR="${ROOT_DIR}/${TARGET_DIR}"
+fi
 
 cargo build \
   --manifest-path "${ENGINE_DIR}/Cargo.toml" \
+  --target-dir "${TARGET_DIR}" \
   --release \
   --target wasm32-unknown-unknown
 
@@ -20,9 +27,9 @@ mkdir -p "${PKG_DIR}"
 wasm-bindgen \
   --target web \
   --out-dir "${PKG_DIR}" \
-  "${ENGINE_DIR}/target/wasm32-unknown-unknown/release/${WASM_NAME}.wasm"
+  "${TARGET_DIR}/wasm32-unknown-unknown/release/${WASM_NAME}.wasm"
 
-cp "${ROOT_DIR}"/web/* "${DIST_DIR}/"
+cp -R "${WEB_DIR}/." "${DIST_DIR}/"
 python3 - <<'PY' "${DIST_DIR}/index.html" "${BUILD_ID}"
 from pathlib import Path
 import sys
@@ -32,3 +39,5 @@ build_id = sys.argv[2]
 index_path.write_text(index_path.read_text().replace("__BUILD_ID__", build_id))
 PY
 touch "${DIST_DIR}/.nojekyll"
+
+echo "Built ${DIST_DIR}"

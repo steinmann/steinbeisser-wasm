@@ -32,7 +32,6 @@ const MAX_MAX_TIME_SECONDS = 600;
 const MAX_TIME_STEP_SECONDS = 0.1;
 const EVAL_EXPECTED_OUTCOME_SCORE_SCALE = 996;
 const MAX_MARBLES_PER_SIDE = 14;
-const CELL_ORDER = new Map(CELLS.map((cell, index) => [cell.coord, index]));
 
 const state = {
   session: null,
@@ -120,19 +119,6 @@ function clampSteppedNumber(value, fallback, minimum, maximum, step) {
 function syncSearchInputs() {
   maxDepthInput.value = String(state.maxDepth);
   maxTimeInput.value = String(state.maxTimeSeconds);
-}
-
-function sortCells(cells) {
-  return [...cells].sort((left, right) => CELL_ORDER.get(left) - CELL_ORDER.get(right));
-}
-
-function cellField(cells) {
-  const sorted = sortCells(cells);
-  return sorted.length ? sorted.join(',') : '-';
-}
-
-function serializePosition({ sideToMove, black, white }) {
-  return `aba-v1;stm=${sideToMove === 'white' ? 'w' : 'b'};black=${cellField(black)};white=${cellField(white)}`;
 }
 
 function compressFenRow(values) {
@@ -239,92 +225,21 @@ function sessionFromPosition(position, turnIndex = 0) {
   return session;
 }
 
-function parseAbaPosition(value) {
-  const trimmed = value.trim();
-  if (!trimmed.startsWith('aba-v1;')) {
-    return null;
-  }
-  const positionState = parsePositionString(trimmed);
-  return serializePosition(positionState);
-}
-
-function expandFenRow(rawRow) {
-  const expanded = [];
-  let index = 0;
-  while (index < rawRow.length) {
-    const char = rawRow[index];
-    if (/\d/.test(char)) {
-      let digits = char;
-      index += 1;
-      while (index < rawRow.length && /\d/.test(rawRow[index])) {
-        digits += rawRow[index];
-        index += 1;
-      }
-      for (let count = Number.parseInt(digits, 10); count > 0; count -= 1) {
-        expanded.push(null);
-      }
-      continue;
-    }
-    if (char === 's' || char === 'S') {
-      expanded.push(char === 'S' ? 'black' : 'white');
-      index += 1;
-      continue;
-    }
-    throw new Error(`Unsupported FEN cell "${char}"`);
-  }
-  return expanded;
-}
-
 function parsePlayStrategyFen(value) {
   const tokens = value.trim().split(/\s+/).filter(Boolean);
   const boardToken = tokens[0];
   if (!boardToken || !boardToken.includes('/')) {
     return null;
   }
-
-  const rows = boardToken.split('/');
-  if (rows.length !== 9) {
-    throw new Error('FEN needs 9 board rows');
-  }
-
-  const black = [];
-  const white = [];
-  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
-    const rowCells = CELLS.filter((cell) => cell.rowIndex === rowIndex);
-    const expanded = expandFenRow(rows[rowIndex]);
-    if (expanded.length !== rowCells.length) {
-      throw new Error(`FEN row ${rowIndex + 1} has ${expanded.length} cells, expected ${rowCells.length}`);
-    }
-    for (let columnIndex = 0; columnIndex < expanded.length; columnIndex += 1) {
-      if (expanded[columnIndex] === 'black') {
-        black.push(rowCells[columnIndex].coord);
-      } else if (expanded[columnIndex] === 'white') {
-        white.push(rowCells[columnIndex].coord);
-      }
-    }
-  }
-
-  const sideToken = tokens.find((token) => /^[bw]$/i.test(token));
-  const sideToMove =
-    sideToken?.toLowerCase() === 'w'
-      ? 'white'
-      : sideToken?.toLowerCase() === 'b'
-        ? 'black'
-        : parsePositionString(state.session.position).sideToMove;
-
-  return serializePosition({ sideToMove, black, white });
+  return serializePlayStrategyFen(parsePositionString(value));
 }
 
 function parsePastedPosition(value) {
-  const abaPosition = parseAbaPosition(value);
-  if (abaPosition) {
-    return abaPosition;
-  }
   const fenPosition = parsePlayStrategyFen(value);
   if (fenPosition) {
     return fenPosition;
   }
-  throw new Error('Paste an aba-v1 position or PlayStrategy FEN');
+  throw new Error('Paste PlayStrategy FEN');
 }
 
 function refreshPositionInput() {
@@ -596,7 +511,7 @@ function refreshCandidates() {
 }
 
 function setEditedPosition(positionState) {
-  const position = serializePosition(positionState);
+  const position = serializePlayStrategyFen(positionState);
   state.session = sessionFromPosition(position, state.session.turnIndex);
   clearSelection();
   clearSearchInfo();

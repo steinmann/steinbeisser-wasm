@@ -142,19 +142,73 @@ const AXIAL_KEY_TO_COORD = new Map(
   CELLS.map((cell) => [`${cell.axial.q},${cell.axial.r}`, cell.coord]),
 );
 
-function coordList(rawValue) {
-  if (!rawValue || rawValue === '-') {
-    return [];
+export function parsePositionString(position) {
+  const tokens = position.trim().split(/\s+/).filter(Boolean);
+  const boardToken = tokens[0];
+  const sideToken = tokens[3];
+  if (!boardToken || !sideToken) {
+    throw new Error('Position must be PlayStrategy FEN');
   }
-  return rawValue.split(',');
+
+  const rows = boardToken.split('/');
+  if (rows.length !== 9) {
+    throw new Error('FEN needs 9 board rows');
+  }
+
+  const black = new Set();
+  const white = new Set();
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    const rowCells = CELLS.filter((cell) => cell.rowIndex === rowIndex);
+    const expanded = expandFenRow(rows[rowIndex]);
+    if (expanded.length !== rowCells.length) {
+      throw new Error(`FEN row ${rowIndex + 1} has ${expanded.length} cells, expected ${rowCells.length}`);
+    }
+    for (let columnIndex = 0; columnIndex < expanded.length; columnIndex += 1) {
+      if (expanded[columnIndex] === 'black') {
+        black.add(rowCells[columnIndex].coord);
+      } else if (expanded[columnIndex] === 'white') {
+        white.add(rowCells[columnIndex].coord);
+      }
+    }
+  }
+
+  const side = sideToken.toLowerCase();
+  if (side !== 'b' && side !== 'w') {
+    throw new Error('FEN side to move must be B or W');
+  }
+  const sideToMove = side === 'w' ? 'white' : 'black';
+  return { sideToMove, black, white };
 }
 
-export function parsePositionString(position) {
-  const parts = position.trim().split(';');
-  const sideToMove = parts[1]?.slice(4) === 'w' ? 'white' : 'black';
-  const black = new Set(coordList(parts[2]?.slice(6)));
-  const white = new Set(coordList(parts[3]?.slice(6)));
-  return { sideToMove, black, white };
+function expandFenRow(rawRow) {
+  const expanded = [];
+  let index = 0;
+  while (index < rawRow.length) {
+    const char = rawRow[index];
+    if (/\d/.test(char)) {
+      let digits = char;
+      index += 1;
+      while (index < rawRow.length && /\d/.test(rawRow[index])) {
+        digits += rawRow[index];
+        index += 1;
+      }
+      const emptyCount = Number.parseInt(digits, 10);
+      if (emptyCount <= 0) {
+        throw new Error(`Unsupported FEN empty count "${digits}"`);
+      }
+      for (let count = emptyCount; count > 0; count -= 1) {
+        expanded.push(null);
+      }
+      continue;
+    }
+    if (char === 's' || char === 'S') {
+      expanded.push(char === 'S' ? 'black' : 'white');
+      index += 1;
+      continue;
+    }
+    throw new Error(`Unsupported FEN cell "${char}"`);
+  }
+  return expanded;
 }
 
 export function occupantAt(positionState, coord) {

@@ -1,3 +1,4 @@
 engine/target/
 dist/
 .DS_Store
+tools/compressor.rs
