@@ -62,28 +62,26 @@ Use `depth = 0` for no depth cap. Use `time_ms = 0` with `depth > 0` for fixed-d
 
 ### Rules
 
-- Engines: 8 playable GitHub Abalone engines.
+- Engines: all 8 playable GitHub Abalone engines.
 - Format: round robin.
 - Openings: all 60 Wall of Variations FEN positions from [`data/positions`](data/positions).
 - Games: each matchup played every opening once from each side, for 120 games per matchup.
 - Time control: 100 ms per move.
-- Steinbeisser build: native compiled Rust from this repository, not WebAssembly.
+- Draws: CodinGame 350-ply cap, repetition, no progress, no move, or tied material.
 - Output: one clean JSON file per matchup in [`data/games`](data/games).
 
 ### Results
 
-Elo is calculated from score percentage against the field.
-
-| # | Author | Repo | Score | Score % | Elo | W-D-L |
-|---:|---|---|---:|---:|---:|---:|
-| 1 | steinmann | [steinbeisser-wasm][steinbeisser-wasm] | 840/840 | 100.0% | +inf | 840-0-0 |
-| 2 | elchairoy | [Gnizabalone][Gnizabalone] | 720/840 | 85.7% | +311 | 720-0-120 |
-| 3 | Retam1 | [abalone-agent][abalone-agent] | 521.5/840 | 62.1% | +86 | 497-49-294 |
-| 4 | ilagko | [AbaloneWeb][AbaloneWeb] | 403.5/840 | 48.0% | -14 | 364-79-397 |
-| 5 | altin | [abalone-ai][abalone-ai] | 403/840 | 48.0% | -14 | 355-96-389 |
-| 6 | MichielVerloop | [AbaloneAI][AbaloneAI] | 229/840 | 27.3% | -170 | 170-118-552 |
-| 7 | negjafari | [AI-abalone][AI-abalone] | 124/840 | 14.8% | -305 | 2-244-594 |
-| 8 | AlirezaNR1 | [Abalone-AI][Abalone-AI] | 119/840 | 14.2% | -313 | 2-234-604 |
+| # | Author | Repo | Score | Score % | W-D-L |
+|---:|---|---|---:|---:|---:|
+| 1 | steinmann | [steinbeisser-wasm][steinbeisser-wasm] | 840/840 | 100.0% | 840-0-0 |
+| 2 | elchairoy | [Gnizabalone][Gnizabalone] | 720/840 | 85.7% | 720-0-120 |
+| 3 | Retam1 | [abalone-agent][abalone-agent] | 521.5/840 | 62.1% | 497-49-294 |
+| 4 | ilagko | [AbaloneWeb][AbaloneWeb] | 403.5/840 | 48.0% | 364-79-397 |
+| 5 | altin | [abalone-ai][abalone-ai] | 403/840 | 48.0% | 355-96-389 |
+| 6 | MichielVerloop | [AbaloneAI][AbaloneAI] | 229/840 | 27.3% | 170-118-552 |
+| 7 | negjafari | [AI-abalone][AI-abalone] | 124/840 | 14.8% | 2-244-594 |
+| 8 | AlirezaNR1 | [Abalone-AI][Abalone-AI] | 119/840 | 14.2% | 2-234-604 |
 
 [steinbeisser-wasm]: https://github.com/steinmann/steinbeisser-wasm
 [Gnizabalone]: https://github.com/elchairoy/Gnizabalone
