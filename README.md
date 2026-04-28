@@ -67,7 +67,7 @@ Use `depth = 0` for no depth cap. Use `time_ms = 0` with `depth > 0` for fixed-d
 - Openings: all 60 Wall of Variations FEN positions from [`data/positions`](data/positions).
 - Games: each matchup played every opening once from each side, for 120 games per matchup.
 - Time control: 100 ms per move.
-- Draws: CodinGame 350-ply cap, repetition, no progress, no move, or tied material.
+- Draws: only when the CodinGame 350-ply cap is reached with even material.
 - Output: one clean JSON file per matchup in [`data/games`](data/games).
 
 ### Results
