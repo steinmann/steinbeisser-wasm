@@ -5,7 +5,7 @@ The standalone engine speaks a minimal line protocol over stdin/stdout. Each req
 Input:
 
 ```text
-SS1ss/SSSsss/1SS1ss1/8/9/8/1ss1SS1/sssSSS/ss1SS 0 0 b 0 1 0 1
+ss1SS/sssSSS/1ss1SS1/8/9/8/1SS1ss1/SSSsss/SS1ss 0 0 b 0 1 0 1
 ```
 
 | # | Field | Meaning |
@@ -22,7 +22,7 @@ SS1ss/SSSsss/1SS1ss1/8/9/8/1ss1SS1/sssSSS/ss1SS 0 0 b 0 1 0 1
 Output:
 
 ```text
-S2ss/SSSsss/1SSSss1/8/9/8/1ss1SS1/sssSSS/ss1SS 0 0 w 1 1 846 1 56 0
+ss2S/sssSSS/1ssSSS1/8/9/8/1SS1ss1/SSSsss/SS1ss 0 0 w 1 1 242 1 59 3
 ```
 
 | # | Field | Meaning |
