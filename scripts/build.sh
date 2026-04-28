@@ -3,13 +3,19 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORKSPACE_DIR="$(cd "${ROOT_DIR}/.." && pwd)"
 ENGINE_DIR="${ROOT_DIR}/engine"
 WEB_DIR="${ROOT_DIR}/web"
 DIST_DIR="${ROOT_DIR}/dist"
 PKG_DIR="${DIST_DIR}/pkg"
 WASM_NAME="steinbeisser_wasm_engine"
 BUILD_ID="$(date -u +%Y%m%d%H%M%S)"
-TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/steinbeisser-wasm-engine-target}"
+
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+  TARGET_DIR="${CARGO_TARGET_DIR}"
+else
+  TARGET_DIR="${WORKSPACE_DIR}/.build/steinbeisser-wasm"
+fi
 
 if [[ "${TARGET_DIR}" != /* ]]; then
   TARGET_DIR="${ROOT_DIR}/${TARGET_DIR}"

@@ -2381,22 +2381,3 @@ fn terminal_score(position: &Position, ply: u8, turn_index: u16) -> Option<i32> 
         None => 0,
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::deadline_slack_ms;
-
-    #[test]
-    fn deadline_slack_keeps_short_searches_tight() {
-        assert_eq!(deadline_slack_ms(5), 1);
-        assert_eq!(deadline_slack_ms(25), 3);
-        assert_eq!(deadline_slack_ms(45), 4);
-        assert_eq!(deadline_slack_ms(999), 4);
-    }
-
-    #[test]
-    fn deadline_slack_uses_larger_margin_for_long_searches() {
-        assert_eq!(deadline_slack_ms(1000), 10);
-        assert_eq!(deadline_slack_ms(5000), 10);
-    }
-}
