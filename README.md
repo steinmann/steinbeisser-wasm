@@ -26,16 +26,16 @@ Input:
 SS1ss/SSSsss/1SS1ss1/8/9/8/1ss1SS1/sssSSS/ss1SS 0 0 b 0 1 0 1
 ```
 
-| # | Field | Example | Meaning |
-|---:|---|---|---|
-| 1 | `board` | `SS1ss/SSSsss/1SS1ss1/8/9/8/1ss1SS1/sssSSS/ss1SS` | `S` black, `s` white, `n` empty |
-| 2 | `black_score` | `0` | White marbles ejected |
-| 3 | `white_score` | `0` | Black marbles ejected |
-| 4 | `side` | `b` | Side to move |
-| 5 | `no_ejection_ply` | `0` | Half-moves since last ejection |
-| 6 | `move_number` | `1` | Full move number |
-| 7 | `time_ms` | `0` | Search time budget in ms |
-| 8 | `depth` | `1` | Max depth; `0` means no cap |
+| # | Field | Meaning |
+|---:|---|---|
+| 1 | `board` | `S` black, `s` white, digits empty |
+| 2 | `black_score` | White marbles ejected |
+| 3 | `white_score` | Black marbles ejected |
+| 4 | `side` | Side to move |
+| 5 | `no_ejection_ply` | Plies since ejection |
+| 6 | `move_number` | Full move |
+| 7 | `time_ms` | Budget in ms |
+| 8 | `depth` | Max depth; `0` no cap |
 
 Output:
 
@@ -43,18 +43,18 @@ Output:
 S2ss/SSSsss/1SSSss1/8/9/8/1ss1SS1/sssSSS/ss1SS 0 0 w 1 1 846 1 56 0
 ```
 
-| # | Field | Example | Meaning |
-|---:|---|---|---|
-| 1 | `board` | `S2ss/SSSsss/1SSSss1/8/9/8/1ss1SS1/sssSSS/ss1SS` | Board after move |
-| 2 | `black_score` | `0` | Updated black score |
-| 3 | `white_score` | `0` | Updated white score |
-| 4 | `side` | `w` | Side to move |
-| 5 | `no_ejection_ply` | `1` | Half-moves since ejection |
-| 6 | `move_number` | `1` | Full move number |
-| 7 | `score` | `846` | Search score |
-| 8 | `depth` | `1` | Completed depth |
-| 9 | `nodes` | `56` | Nodes searched |
-| 10 | `elapsed_ms` | `0` | Engine elapsed time |
+| # | Field | Meaning |
+|---:|---|---|
+| 1 | `board` | Board after move |
+| 2 | `black_score` | Updated black score |
+| 3 | `white_score` | Updated white score |
+| 4 | `side` | Side to move |
+| 5 | `no_ejection_ply` | Plies since ejection |
+| 6 | `move_number` | Full move |
+| 7 | `score` | Search score |
+| 8 | `depth` | Completed depth |
+| 9 | `nodes` | Nodes searched |
+| 10 | `elapsed_ms` | Engine elapsed time |
 
 Use `depth = 0` for no depth cap. Use `time_ms = 0` with `depth > 0` for fixed-depth search. `time_ms = 0` and `depth = 0` is invalid.
 
