@@ -1,21 +1,3 @@
-## Design
-
-### Board
-
-The board is a 61-cell hex grid represented with axial coordinates internally. Each cell also has a compact numeric id, so geometry lookups, neighbor masks, and row/column coordinates are cheap to move between. Positions keep sorted marble lists for canonical state and compact bitsets for fast occupancy tests. The move generator and search work mostly from those bitsets and precomputed geometry tables.
-
-### Movegen
-
-Move generation considers every legal group of one, two, or three friendly marbles. Each group is tested in the six hex directions as either an inline move or a broadside move. Inline moves handle pushes and ejections by checking the ray in front of the group, while broadside moves require all translated destination cells to be empty. The search path uses precomputed source-group and direction tables so legality checks avoid rebuilding the same geometry over and over.
-
-### Eval
-
-Evaluation is an embedded NNUE-style network stored in `net.mlp`. The sparse features are the occupied cell/color pairs, maintained incrementally in a 58-wide accumulator for both black and white perspectives. Eight dense features are mixed into the same 58-wide layer, including shape features such as edge pressure, contact pairs, liberties, singletons, remaining turns, and no-ejection ply. Inference pads that 58-wide layer to 64 values, applies an 8-bit quantized hidden layer with 32 units, then an 8-bit quantized output layer. The sparse input weights are 16-bit, while the hidden/output weights and activations are 8-bit.
-
-### Search
-
-Search is iterative deepening alpha-beta with aspiration windows around the previous iteration score. It keeps a transposition table, eval cache, history scores, countermoves, and correction history across searches. Move ordering prioritizes hash moves, ejections, countermoves, and history-guided candidates, with partial sorting near the front of the move list. The tree uses null-move pruning, futility pruning, late move reductions, and late move pruning to cut low-value branches. Timed searches poll the clock periodically and use a deadline margin so the engine can stop cleanly before the budget is exhausted.
-
 ## Usage
 
 The standalone engine speaks a minimal line protocol over stdin/stdout. Each request is one space-delimited line. Each response is one space-delimited line. The engine returns the updated FEN after applying its chosen move.
@@ -62,13 +44,13 @@ Use `depth = 0` for no depth cap. Use `time_ms = 0` with `depth > 0` for fixed-d
 
 ### Rules
 
-- Engines: all 8 playable GitHub Abalone engines.
-- Format: round robin.
-- Openings: all 60 Wall of Variations FEN positions from [`data/positions`](data/positions).
-- Games: each matchup played every opening once from each side, for 120 games per matchup.
+- Engines: All 8 playable GitHub Abalone engines.
+- Format: Round robin.
+- Openings: All 60 Wall of Variations FEN positions from [`data/positions`](data/positions).
+- Games: Each matchup played every opening once from each side, for 120 games per matchup.
 - Time control: 100 ms per move.
-- Draws: only when the CodinGame 350-ply cap is reached with even material.
-- Output: one clean JSON file per matchup in [`data/games`](data/games).
+- Winning: Eject 6 enemy marbles, or lead on ejections after the 350-ply cap. Tied ejections are a draw.
+- Output: One clean JSON file per matchup in [`data/games`](data/games).
 
 ### Results
 
