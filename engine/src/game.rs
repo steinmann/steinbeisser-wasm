@@ -11,7 +11,7 @@ use crate::search::{
 };
 use std::str::FromStr;
 
-pub const START_POSITION: &str = "ss1SS/sssSSS/1ss1SS1/8/9/8/1SS2ss/SSSsss/SS1ss 0 0 B 0 0";
+pub const START_POSITION: &str = "SS1ss/SSSsss/1SS1ss1/8/9/8/1ss1SS1/sssSSS/ss1SS 0 0 B 0 0";
 
 #[derive(Clone, Debug)]
 struct MoveStackEntry {
