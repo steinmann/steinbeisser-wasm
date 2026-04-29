@@ -53,7 +53,7 @@ const state = {
   nextRequestId: 1,
   activeRequestId: null,
   lastEngineSearchInfo: null,
-  debugEnabled: true,
+  debugEnabled: false,
   lastEngineDebugInfo: null,
   notice: '',
   noticeKind: null,
