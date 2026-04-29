@@ -19,7 +19,7 @@ const SHORT_SEARCH_DEADLINE_SLACK_MS: u64 = 4;
 const LONG_SEARCH_DEADLINE_SLACK_MS: u64 = 15;
 const LONG_SEARCH_DEADLINE_SLACK_THRESHOLD_MS: u64 = 1000;
 #[cfg(not(target_arch = "wasm32"))]
-const DEPTH_ADMISSION_MARGIN_MS: u64 = 2;
+const DEPTH_ADMISSION_MARGIN_MS: u64 = 4;
 #[cfg(target_arch = "wasm32")]
 const DEPTH_ADMISSION_MARGIN_MS: u64 = 1;
 const ABORT_POLL_MASK: u64 = 8191;
@@ -637,12 +637,6 @@ impl Searcher {
         self.turn_at_ply(ply).saturating_add(u16::from(depth)) >= MAX_GAME_TURNS
     }
     #[inline]
-    fn child_search_reaches_terminal_horizon(&self, ply: u8, child_depth: u8) -> bool {
-        self.turn_at_ply(ply.saturating_add(1))
-            .saturating_add(u16::from(child_depth))
-            >= MAX_GAME_TURNS
-    }
-    #[inline]
     fn terminal_horizon_requires_exact_search(&self, ply: u8, depth: u8) -> bool {
         self.reaches_terminal_horizon(ply, depth)
     }
@@ -731,6 +725,26 @@ impl Searcher {
             current_correction + (target_correction - current_correction) * blend / 8;
         *slot =
             updated_correction.clamp(-CORRECTION_HISTORY_CLAMP, CORRECTION_HISTORY_CLAMP) as i16;
+    }
+    fn update_tt_cutoff_correction(
+        &mut self,
+        position_state: &PositionState,
+        key: u64,
+        score: i32,
+        depth: u8,
+        turn_index: u16,
+        no_progress: u16,
+        raw: &mut Option<i32>,
+    ) {
+        let raw_eval = *raw
+            .get_or_insert_with(|| self.evaluate_position(position_state, turn_index, no_progress));
+        self.update_correction_history(
+            position_state.position().side_to_move(),
+            key,
+            raw_eval,
+            score,
+            depth,
+        );
     }
     pub(crate) fn search(
         &mut self,
@@ -883,6 +897,16 @@ impl Searcher {
         let total_marbles = position_state.position().marble_count(Color::Black)
             + position_state.position().marble_count(Color::White);
         if completed_depth == 0 || total_marbles == 28 {
+            return self.search_root_window(
+                position_state,
+                depth,
+                history,
+                previous_best_move,
+                -SEARCH_SCORE_BOUND,
+                SEARCH_SCORE_BOUND,
+            );
+        }
+        if self.terminal_horizon_requires_exact_search(0, depth) {
             return self.search_root_window(
                 position_state,
                 depth,
@@ -1180,13 +1204,10 @@ impl Searcher {
                 tuned = tuned.saturating_sub(1);
             }
             let tuned = tuned.min(depth.saturating_sub(2));
-            let scout_depth = depth.saturating_sub(1 + tuned);
-            if !self.terminal_horizon_requires_exact_search(ply, depth)
-                || self.child_search_reaches_terminal_horizon(ply, scout_depth)
-            {
-                tuned
-            } else {
+            if self.terminal_horizon_requires_exact_search(ply, depth) {
                 0
+            } else {
+                tuned
             }
         } else {
             0
@@ -1245,64 +1266,50 @@ impl Searcher {
         if let Some(score) = terminal_score(position_state.position(), ply, self.turn_at_ply(ply)) {
             return Ok(score);
         }
+        let mut beta = beta;
         let key = history.search_key(current, self.turn_at_ply(ply));
         let exact_terminal_horizon = self.terminal_horizon_requires_exact_search(ply, depth);
-        let mut beta = beta;
         let mut raw_static = None;
         if let Some(entry) = self.probe_transposition(key, depth) {
             let score = decode_tt_score(entry.score, ply);
             match entry.bound {
-                BoundKind::Exact => {
-                    let raw = *raw_static.get_or_insert_with(|| {
-                        self.evaluate_position(
-                            position_state,
-                            self.turn_at_ply(ply),
-                            history.current_no_progress(),
-                        )
-                    });
-                    self.update_correction_history(
-                        position_state.position().side_to_move(),
-                        key,
-                        raw,
-                        score,
-                        depth,
-                    );
-                    return Ok(score);
-                }
-                BoundKind::Lower => alpha = alpha.max(score),
-                BoundKind::Upper if score <= alpha => {
-                    let raw = *raw_static.get_or_insert_with(|| {
-                        self.evaluate_position(
-                            position_state,
-                            self.turn_at_ply(ply),
-                            history.current_no_progress(),
-                        )
-                    });
-                    self.update_correction_history(
-                        position_state.position().side_to_move(),
-                        key,
-                        raw,
-                        score,
-                        depth,
-                    );
-                    return Ok(score);
-                }
-                BoundKind::Upper => beta = beta.min(score),
-            }
-            if alpha >= beta {
-                let raw = *raw_static.get_or_insert_with(|| {
-                    self.evaluate_position(
+                BoundKind::Exact if !exact_terminal_horizon => {
+                    self.update_tt_cutoff_correction(
                         position_state,
+                        key,
+                        score,
+                        depth,
                         self.turn_at_ply(ply),
                         history.current_no_progress(),
-                    )
-                });
-                self.update_correction_history(
-                    position_state.position().side_to_move(),
+                        &mut raw_static,
+                    );
+                    return Ok(score);
+                }
+                BoundKind::Lower if !exact_terminal_horizon => alpha = alpha.max(score),
+                BoundKind::Upper if !exact_terminal_horizon && score <= alpha => {
+                    self.update_tt_cutoff_correction(
+                        position_state,
+                        key,
+                        score,
+                        depth,
+                        self.turn_at_ply(ply),
+                        history.current_no_progress(),
+                        &mut raw_static,
+                    );
+                    return Ok(score);
+                }
+                BoundKind::Upper if !exact_terminal_horizon => beta = beta.min(score),
+                _ => {}
+            }
+            if alpha >= beta && !exact_terminal_horizon {
+                self.update_tt_cutoff_correction(
+                    position_state,
                     key,
-                    raw,
                     score,
                     depth,
+                    self.turn_at_ply(ply),
+                    history.current_no_progress(),
+                    &mut raw_static,
                 );
                 return Ok(score);
             }
