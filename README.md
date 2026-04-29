@@ -1,6 +1,6 @@
 ## Play
 
-[![Play Steinbeisser WASM](assets/steinbeisser-wasm-preview.png)](https://steinmann.github.io/steinbeisser-wasm/)
+[![Play Steinbeisser WASM](web/steinbeisser-wasm-preview.png)](https://steinmann.github.io/steinbeisser-wasm/)
 
 ## Standalone Engine
 
