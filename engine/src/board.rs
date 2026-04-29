@@ -922,8 +922,8 @@ impl fmt::Display for Position {
         }
 
         let side = match self.side_to_move {
-            Color::Black => 'B',
-            Color::White => 'W',
+            Color::Black => 'b',
+            Color::White => 'w',
         };
         let white_ejected = Self::MAX_PIECES_PER_SIDE.saturating_sub(self.white.len());
         let black_ejected = Self::MAX_PIECES_PER_SIDE.saturating_sub(self.black.len());

@@ -2,14 +2,14 @@
 
 [![Play Steinbeisser WASM](web/steinbeisser-wasm-preview.png)](https://steinmann.github.io/steinbeisser-wasm/)
 
-## Standalone Engine
+## API
 
-The standalone engine speaks a minimal line protocol over stdin/stdout. Each request is one space-delimited line. Each response is one space-delimited line. The engine returns the updated FEN after applying its chosen move.
+The engine reads one space-delimited line from stdin and writes one space-delimited line to stdout.
 
 Example input, from the Belgian Daisy start with black to move:
 
 ```text
-ss1SS/sssSSS/1ss1SS1/8/9/8/1SS1ss1/SSSsss/SS1ss 0 0 B 0 1 10000 0
+ss1SS/sssSSS/1ss1SS1/8/9/8/1SS1ss1/SSSsss/SS1ss 0 0 b 0 1 10000 0
 ```
 
 | # | Field | Meaning |

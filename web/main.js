@@ -163,7 +163,7 @@ function serializePlayStrategyFen(positionState) {
 
   const whiteEjected = Math.max(0, MAX_MARBLES_PER_SIDE - positionState.white.size);
   const blackEjected = Math.max(0, MAX_MARBLES_PER_SIDE - positionState.black.size);
-  const side = positionState.sideToMove === 'white' ? 'W' : 'B';
+  const side = positionState.sideToMove === 'white' ? 'w' : 'b';
   return `${rows.join('/')} 0 0 ${side} ${whiteEjected} ${blackEjected}`;
 }
 

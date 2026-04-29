@@ -174,7 +174,7 @@ export function parsePositionString(position) {
 
   const side = sideToken.toLowerCase();
   if (side !== 'b' && side !== 'w') {
-    throw new Error('FEN side to move must be B or W');
+    throw new Error('FEN side to move must be b or w');
   }
   const sideToMove = side === 'w' ? 'white' : 'black';
   return { sideToMove, black, white };
