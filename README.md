@@ -10,7 +10,7 @@ ss1SS/sssSSS/1ss1SS1/8/9/8/1SS1ss1/SSSsss/SS1ss 0 0 b 0 1 0 1
 
 | # | Field | Meaning |
 |---:|---|---|
-| 1 | `board` | `S` black, `s` white, digits empty |
+| 1 | `board` | `S` black, `s` white, `1-9` empty |
 | 2 | `black_score` | White marbles ejected |
 | 3 | `white_score` | Black marbles ejected |
 | 4 | `side` | Side to move |
