@@ -1,6 +1,6 @@
 ## Play
 
-[![Play Steinbeisser WASM](web/steinbeisser-wasm-preview.png)](https://steinmann.github.io/steinbeisser-wasm/)
+[![Play Steinbeisser WASM](web/assets/steinbeisser-wasm-preview.png)](https://steinmann.github.io/steinbeisser-wasm/)
 
 ## API
 
