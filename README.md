@@ -76,3 +76,6 @@ Use `depth = 0` for no depth cap. Use `time_ms = 0` with `depth > 0` for fixed-d
 [AbaloneAI]: https://github.com/MichielVerloop/AbaloneAI
 [AI-abalone]: https://github.com/negjafari/AI-abalone
 [Abalone-AI]: https://github.com/AlirezaNR1/Abalone-AI
+
+## CodinGame Abalone League
+https://www.codingame.com/multiplayer/bot-programming/abalone/leaderboard
