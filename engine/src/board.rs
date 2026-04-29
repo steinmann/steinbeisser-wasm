@@ -469,7 +469,6 @@ impl Geometry {
     }
 }
 
-// move shapes and move text
 #[derive(Clone, Copy, Debug)]
 pub struct Move {
     source_cells: [CellId; 3],
@@ -706,7 +705,6 @@ fn validate_contiguous_group(source_cells: &[CellId]) -> Result<(), MoveError> {
     Ok(())
 }
 
-// canonical positions and validation
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Position {
     side_to_move: Color,
