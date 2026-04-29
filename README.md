@@ -1,4 +1,7 @@
-## Usage
+## Play
+https://steinmann.github.io/steinbeisser-wasm/
+
+## Standalone Engine
 
 The standalone engine speaks a minimal line protocol over stdin/stdout. Each request is one space-delimited line. Each response is one space-delimited line. The engine returns the updated FEN after applying its chosen move.
 
