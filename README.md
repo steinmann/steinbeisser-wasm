@@ -1,6 +1,6 @@
 ## Play
 
-[![Play Steinbeisser WASM](web/assets/steinbeisser-wasm-preview.png)](https://steinmann.github.io/steinbeisser-wasm/)
+[![Play Steinbeisser WASM](assets/steinbeisser-wasm-preview.png)](https://steinmann.github.io/steinbeisser-wasm/)
 
 ## API
 
@@ -91,4 +91,7 @@ Use `depth = 0` for no depth cap. Use `time_ms = 0` with `depth > 0` for fixed-d
 [Abalone-AI]: https://github.com/AlirezaNR1/Abalone-AI
 
 ## CodinGame Abalone League
-https://www.codingame.com/multiplayer/bot-programming/abalone/leaderboard
+
+<a href="https://www.codingame.com/multiplayer/bot-programming/abalone/leaderboard">
+  <img src="assets/codingame-ladder.png" alt="CodinGame Abalone leaderboard showing steinbeisser ranked first" width="100%">
+</a>
