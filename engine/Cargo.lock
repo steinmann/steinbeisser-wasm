@@ -121,8 +121,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "steinbeisser-wasm-engine"
-version = "0.1.0"
+name = "steinbeisser"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde-wasm-bindgen",

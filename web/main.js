@@ -1,8 +1,8 @@
 const buildId = new URL(import.meta.url).search;
-const wasmModulePath = `./pkg/steinbeisser_wasm_engine_bg.wasm${buildId}`;
+const wasmModulePath = `./pkg/steinbeisser_bg.wasm${buildId}`;
 const workerModulePath = `./worker.js${buildId}`;
 
-const engineModule = await import(`./pkg/steinbeisser_wasm_engine.js${buildId}`);
+const engineModule = await import(`./pkg/steinbeisser.js${buildId}`);
 const boardModule = await import(`./board.js${buildId}`);
 
 const {

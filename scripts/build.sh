@@ -8,7 +8,7 @@ ENGINE_DIR="${ROOT_DIR}/engine"
 WEB_DIR="${ROOT_DIR}/web"
 DIST_DIR="${ROOT_DIR}/dist"
 PKG_DIR="${DIST_DIR}/pkg"
-WASM_NAME="steinbeisser_wasm_engine"
+WASM_NAME="steinbeisser"
 BUILD_ID="$(date -u +%Y%m%d%H%M%S)"
 
 if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then

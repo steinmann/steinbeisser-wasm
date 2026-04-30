@@ -1,5 +1,5 @@
 const buildId = new URL(self.location.href).search;
-const wasmModulePath = `./pkg/steinbeisser_wasm_engine_bg.wasm${buildId}`;
+const wasmModulePath = `./pkg/steinbeisser_bg.wasm${buildId}`;
 
 let ready = false;
 let cancelledRequestId = null;
@@ -10,7 +10,7 @@ let initEngine = null;
 
 async function ensureEngineReady() {
   if (!engineModulePromise) {
-    engineModulePromise = import(`./pkg/steinbeisser_wasm_engine.js${buildId}`);
+    engineModulePromise = import(`./pkg/steinbeisser.js${buildId}`);
   }
 
   if (ready) {
