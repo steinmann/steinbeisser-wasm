@@ -44,11 +44,11 @@ ss1SS/sssSSS/1ss1SS1/8/9/3S4/1SS1ss1/SSSsss/1S1ss 0 0 w 1 1 698 18 41377792 9985
 
 Use `depth = 0` for no depth cap. Use `time_ms = 0` with `depth > 0` for fixed-depth search. `time_ms = 0` and `depth = 0` is invalid.
 
-## GitHub Tournament
+## Open Source Engine Tournament
 
 ### Rules
 
-- Engines: All 14 playable GitHub Abalone engines.
+- Engines: All open source engines.
 - Format: Round robin.
 - Openings: All 60 Wall of Variations FEN positions from [`data/positions`](data/positions).
 - Games: Each matchup played every opening once from each side, for 120 games per matchup.
