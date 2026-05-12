@@ -60,7 +60,7 @@ Use `depth = 0` for no depth cap. Use `time_ms = 0` with `depth > 0` for fixed-d
 
 | # | Author | Engine | Elo | W-D-L | Score | Score % |
 |---:|---|---|---:|---:|---:|---:|
-| 1 | steinmann | [steinbeisser][steinbeisser-wasm] | 3290 | 1556-3-1 | 1557.5/1560 | 99.84% |
+| 1 | steinmann | [steinbeisser 1.0][steinbeisser-wasm] | 3290 | 1556-3-1 | 1557.5/1560 | 99.84% |
 | 2 | peso | [EL BOANA][el_boana] | 2516 | 1365-11-184 | 1370.5/1560 | 87.85% |
 | 3 | elchairoy | [Gnizabalone][Gnizabalone] | 2500 | 1352-5-203 | 1354.5/1560 | 86.83% |
 | 4 | AlSaeed | [Heuristic Minimax Player][15618-Final-Project] | 2397 | 1214-21-325 | 1224.5/1560 | 78.49% |
