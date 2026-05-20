@@ -87,7 +87,7 @@ impl PositionState {
                 continue;
             }
             for direction in group.directions.iter().flatten() {
-                let Some(is_ejection) = self.fast_group_direction_legality(
+                let Some((is_push, is_ejection)) = self.fast_group_direction_legality(
                     group.len as usize,
                     direction,
                     side_bits,
@@ -99,6 +99,7 @@ impl PositionState {
                 moves.push(crate::search::LegalMoveEntry {
                     candidate_move: direction.candidate_move,
                     is_ejection,
+                    is_push,
                     history_key: direction.history_key,
                 });
             }
@@ -117,16 +118,20 @@ impl PositionState {
         side_bits: u64,
         enemy_bits: u64,
         occupied_bits: u64,
-    ) -> Option<bool> {
+    ) -> Option<(bool, bool)> {
         if direction.inline {
             self.fast_inline_legality(len, direction, side_bits, enemy_bits, occupied_bits)
         } else {
             self.fast_broadside_legality(direction.translated_mask, occupied_bits)
         }
     }
-    fn fast_broadside_legality(&self, translated_mask: u64, occupied_bits: u64) -> Option<bool> {
+    fn fast_broadside_legality(
+        &self,
+        translated_mask: u64,
+        occupied_bits: u64,
+    ) -> Option<(bool, bool)> {
         if occupied_bits & translated_mask == 0 {
-            Some(false)
+            Some((false, false))
         } else {
             None
         }
@@ -138,10 +143,10 @@ impl PositionState {
         side_bits: u64,
         enemy_bits: u64,
         occupied_bits: u64,
-    ) -> Option<bool> {
+    ) -> Option<(bool, bool)> {
         let first_bit = direction.ray_bits[0];
         if occupied_bits & first_bit == 0 {
-            return Some(false);
+            return Some((false, false));
         }
         if side_bits & first_bit != 0 {
             return None;
@@ -164,10 +169,10 @@ impl PositionState {
                 if occupied_bits & (1u64 << cell.as_u8()) != 0 {
                     None
                 } else {
-                    Some(false)
+                    Some((true, false))
                 }
             }
-            None => Some(true),
+            None => Some((true, true)),
         }
     }
     pub fn apply_move(
@@ -202,6 +207,7 @@ impl PositionState {
                     .pushed_destinations
                     .iter()
                     .any(|destination| destination.is_none()),
+            is_push: plan.pushed_cells.len > 0,
             history_key: crate::search::history_group_key(
                 candidate_move.source_cells(),
                 candidate_move.direction(),

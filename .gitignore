@@ -2,3 +2,6 @@ engine/target/
 dist/
 .DS_Store
 tools/compressor.rs
+data/random100K.fen
+data/training/
+experiments.log

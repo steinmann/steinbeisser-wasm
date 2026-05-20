@@ -12,10 +12,10 @@ const NNUE_SCORE_LIMIT: f32 = 5000.0;
 const NNUE_MAX_OUT: f32 = 1.0;
 const NNUE_SPARSE: usize = 122;
 const DENSE_FEATURE_COUNT: usize = 8;
-const SPARSE_FEATURE_COUNT: usize = 58;
-const NNUE_H1: usize = 32;
-const NNUE_H0_PAD: usize = 64;
-const NNUE_H1_PAD: usize = 32;
+const SPARSE_FEATURE_COUNT: usize = 84;
+const NNUE_H1: usize = 50;
+const NNUE_H0_PAD: usize = 96;
+const NNUE_H1_PAD: usize = 64;
 #[derive(Clone)]
 pub(crate) struct NnueAccumulator {
     black: [i32; SPARSE_FEATURE_COUNT],

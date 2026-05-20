@@ -46,6 +46,7 @@ const EJECTION_ORDER_BONUS: i32 = 1250000;
 const HISTORY_LMR_THRESHOLD: i32 = 512;
 const CORRECTION_HISTORY_CLAMP: i32 = 192;
 const NULL_MOVE_MARGIN: i32 = 96;
+const PUSH_ORDER_BONUS: i32 = 650000;
 const HISTORY_SOURCE_GROUPS_LEN1: usize = crate::board::CELL_COUNT;
 const HISTORY_SOURCE_GROUPS_LEN2: usize = combination_count(crate::board::CELL_COUNT, 2);
 const HISTORY_SOURCE_GROUPS_LEN3: usize = combination_count(crate::board::CELL_COUNT, 3);
@@ -1703,6 +1704,11 @@ impl Searcher {
         if move_entry.is_ejection {
             return EJECTION_ORDER_BONUS + self.history_score(side, move_entry.history_key);
         }
+        if move_entry.is_push {
+            return PUSH_ORDER_BONUS
+                + i32::try_from(move_entry.candidate_move.len()).unwrap_or(0) * 10000
+                + self.history_score(side, move_entry.history_key);
+        }
         self.history_score(side, move_entry.history_key)
     }
     fn history_score(&self, side: Color, history_key: u32) -> i32 {
@@ -2127,6 +2133,7 @@ pub(crate) struct SearchAbort;
 pub(crate) struct LegalMoveEntry {
     pub(crate) candidate_move: Move,
     pub(crate) is_ejection: bool,
+    pub(crate) is_push: bool,
     pub(crate) history_key: u32,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
