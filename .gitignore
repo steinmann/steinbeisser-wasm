@@ -1,4 +1,8 @@
 engine/target/
+nnue/target/
+nnue/**/target/
+nnue/**/*.pyc
+nnue/train.log
 dist/
 .DS_Store
 tools/compressor.rs

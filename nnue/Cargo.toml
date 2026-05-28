@@ -1,0 +1,21 @@
+[package]
+name = "nnue"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "nnue"
+path = "src/bin/nnue.rs"
+
+[[bin]]
+name = "nnue-selfplay"
+path = "src/bin/selfplay.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+steinbeisser = { path = "../engine" }
+
+[lints.rust]
+unsafe_code = "deny"
