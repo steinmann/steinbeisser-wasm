@@ -233,7 +233,6 @@ class OpeningBookConfig:
     match_random_count: int
     tournament_openings: Path
     tournament_openings_explicit: bool
-    tournament_random_count: int
 
 
 @dataclass(frozen=True)
@@ -739,6 +738,17 @@ plt.close(fig)
 
 
 def plotting_python() -> Path | None:
+    def has_plotting(candidate: Path) -> bool:
+        if not candidate.is_file():
+            return False
+        probe = subprocess.run(
+            [str(candidate), "-c", "import matplotlib, seaborn"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return probe.returncode == 0
+
     candidates = [
         Path(os.environ["STEINBEISSER_PLOT_PYTHON"])
         for _ in [None]
@@ -747,17 +757,44 @@ def plotting_python() -> Path | None:
     candidates += [Path("/tmp/steinbeisser-plot-venv/bin/python"), Path(sys.executable)]
     seen: set[Path] = set()
     for candidate in candidates:
-        if candidate in seen or not candidate.is_file():
+        if candidate in seen:
             continue
         seen.add(candidate)
-        probe = subprocess.run(
-            [str(candidate), "-c", "import matplotlib, seaborn"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if probe.returncode == 0:
+        if has_plotting(candidate):
             return candidate
+    venv_python = Path("/tmp/steinbeisser-plot-venv/bin/python")
+    venv_root = venv_python.parent.parent
+    try:
+        if not venv_python.is_file():
+            subprocess.run(
+                [sys.executable, "-m", "venv", str(venv_root)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=180,
+                check=True,
+            )
+        subprocess.run(
+            [
+                str(venv_python),
+                "-m",
+                "pip",
+                "install",
+                "--quiet",
+                "matplotlib",
+                "seaborn",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=300,
+            check=True,
+        )
+    except Exception as error:
+        append_log(f"# plot dependency install failed: {error}")
+        return None
+    if has_plotting(venv_python):
+        return venv_python
     return None
 
 
@@ -917,24 +954,48 @@ def prepare_match_openings(config: OpeningBookConfig) -> None:
     config.match_openings.write_text("\n".join(openings) + "\n", encoding="utf-8")
 
 
-def prepare_tournament_openings(config: OpeningBookConfig) -> Path:
+def write_opening_file(path: Path, openings: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(openings) + "\n", encoding="utf-8")
+
+
+def require_unique_openings(openings: list[str], label: str) -> None:
+    seen: set[str] = set()
+    for index, opening in enumerate(openings, start=1):
+        if opening in seen:
+            raise SystemExit(f"{label} contains duplicate opening at line {index}")
+        seen.add(opening)
+
+
+def prepare_tournament_openings(
+    config: OpeningBookConfig,
+    paired_openings_per_pairing: int,
+) -> tuple[Path, list[str]]:
+    required = paired_openings_per_pairing
     if config.tournament_openings_explicit:
         if not config.tournament_openings.is_file():
             raise SystemExit(
                 f"missing tournament openings override: {config.tournament_openings}"
             )
-        return config.tournament_openings
-    prepare_match_openings(config)
-    if config.tournament_openings == config.match_openings:
-        return config.tournament_openings
-    openings = load_book_openings(
+        openings = [
+            normalize_material_scores(line)
+            for line in read_fen_lines(config.tournament_openings)
+        ]
+        if len(openings) < required:
+            raise SystemExit(
+                f"{config.tournament_openings} contains {len(openings)} tournament openings; "
+                f"need {required} so no opening repeats within a pairing"
+            )
+        openings = openings[:required]
+        require_unique_openings(openings, "tournament opening override")
+        return config.tournament_openings, openings
+    openings = load_unique_book_openings(
         config.random_openings,
-        config.tournament_random_count,
+        required,
         "tournament",
     )
-    config.tournament_openings.parent.mkdir(parents=True, exist_ok=True)
-    config.tournament_openings.write_text("\n".join(openings) + "\n", encoding="utf-8")
-    return config.tournament_openings
+    write_opening_file(config.tournament_openings, openings)
+    return config.tournament_openings, openings
 
 
 def load_single_position_openings(config: OpeningBookConfig) -> list[str]:
@@ -969,6 +1030,22 @@ def load_book_openings(path: Path, count: int, label: str) -> list[str]:
     if len(openings) < count:
         raise SystemExit(f"{path} contains {len(openings)} FENs; need {count} for {label}")
     return openings[:count]
+
+
+def load_unique_book_openings(path: Path, count: int, label: str) -> list[str]:
+    if not path.is_file():
+        raise SystemExit(f"missing {label} opening book: {path}")
+    openings: list[str] = []
+    seen: set[str] = set()
+    for line in read_fen_lines(path):
+        opening = normalize_material_scores(line)
+        if opening in seen:
+            continue
+        seen.add(opening)
+        openings.append(opening)
+        if len(openings) == count:
+            return openings
+    raise SystemExit(f"{path} contains {len(openings)} unique FENs; need {count} for {label}")
 
 
 def normalize_material_scores(fen: str) -> str:
@@ -1067,16 +1144,16 @@ MATCH_GAMES = env_int(
 )
 SCREEN_CHECKPOINTS = env_int("STEINBEISSER_TRAIN_SCREEN_CHECKPOINTS", 3)
 TARGET_TRAIN_SAMPLES = env_int("STEINBEISSER_TRAIN_TARGET_SAMPLES", 15_000_000)
-TOURNAMENT_RANDOM_POSITION_COUNT = env_int(
-    "STEINBEISSER_TRAIN_TOURNAMENT_RANDOM_POSITIONS",
-    500,
+TOURNAMENT_GAMES_PER_ENGINE = env_int(
+    "STEINBEISSER_TRAIN_TOURNAMENT_GAMES_PER_ENGINE",
+    10_000,
 )
-TOURNAMENT_GAMES_PER_PAIRING = env_int(
+TOURNAMENT_GAMES_PER_PAIRING_OVERRIDE = env_int(
     "STEINBEISSER_TRAIN_TOURNAMENT_GAMES_PER_PAIRING",
-    MATCH_GAMES,
+    0,
 )
 TOURNAMENT_OPENINGS = Path(
-    os.environ.get("STEINBEISSER_TRAIN_TOURNAMENT_OPENINGS", MATCH_OPENINGS)
+    os.environ.get("STEINBEISSER_TRAIN_TOURNAMENT_OPENINGS", WORK_DIR / "tournament_openings.fen")
 )
 OPENING_CONFIG = OpeningBookConfig(
     open_book=OPENINGS,
@@ -1088,7 +1165,6 @@ OPENING_CONFIG = OpeningBookConfig(
     match_random_count=MATCH_RANDOM_POSITION_COUNT,
     tournament_openings=TOURNAMENT_OPENINGS,
     tournament_openings_explicit=bool(os.environ.get("STEINBEISSER_TRAIN_TOURNAMENT_OPENINGS")),
-    tournament_random_count=TOURNAMENT_RANDOM_POSITION_COUNT,
 )
 MAX_CYCLES = env_int("STEINBEISSER_TRAIN_MAX_CYCLES", 30)
 GENERATION_CHUNK_SAMPLES = env_int(
@@ -1850,6 +1926,7 @@ def setup() -> None:
         f"screen_games={MATCH_GAMES} "
         f"parallel_games={GENERATION_WORKERS} "
         f"tournament_parallel_matches={TOURNAMENT_PARALLEL_MATCHES} "
+        f"tournament_target_games_per_engine={TOURNAMENT_GAMES_PER_ENGINE} "
         f"loader_workers={NNUE_LOADER_WORKERS} "
         f"train_threads={NNUE_TRAIN_THREADS} "
         f"min_train_increment={MIN_TRAIN_INCREMENT} "
@@ -1870,11 +1947,13 @@ def setup() -> None:
         raise SystemExit("STEINBEISSER_TRAIN_GENERATION_BACKLOG_SAMPLES must be non-negative")
     if SCREEN_CHECKPOINTS <= 0:
         raise SystemExit("STEINBEISSER_TRAIN_SCREEN_CHECKPOINTS must be positive")
-    if TOURNAMENT_RANDOM_POSITION_COUNT <= 0:
-        raise SystemExit("STEINBEISSER_TRAIN_TOURNAMENT_RANDOM_POSITIONS must be positive")
-    if TOURNAMENT_GAMES_PER_PAIRING <= 0 or TOURNAMENT_GAMES_PER_PAIRING % 2 != 0:
+    if TOURNAMENT_GAMES_PER_ENGINE <= 0:
         raise SystemExit(
-            "STEINBEISSER_TRAIN_TOURNAMENT_GAMES_PER_PAIRING must be a positive even number"
+            "STEINBEISSER_TRAIN_TOURNAMENT_GAMES_PER_ENGINE must be positive"
+        )
+    if TOURNAMENT_GAMES_PER_PAIRING_OVERRIDE < 0:
+        raise SystemExit(
+            "STEINBEISSER_TRAIN_TOURNAMENT_GAMES_PER_PAIRING must be non-negative"
         )
     if MAX_ABS_SCORE < 0:
         raise SystemExit("STEINBEISSER_TRAIN_MAX_ABS_SCORE must be non-negative")
@@ -2460,6 +2539,46 @@ def reference_tournament_player() -> dict[str, object]:
     }
 
 
+def even_game_count(games: int) -> int:
+    if games <= 0:
+        return 2
+    return games if games % 2 == 0 else games + 1
+
+
+def tournament_games_per_pairing(player_count: int) -> int:
+    opponents = max(1, player_count - 1)
+    required = even_game_count(math.ceil(TOURNAMENT_GAMES_PER_ENGINE / opponents))
+    configured = even_game_count(TOURNAMENT_GAMES_PER_PAIRING_OVERRIDE)
+    return max(required, configured)
+
+
+def tournament_summary_has_required_games(summary: dict[str, object] | None) -> bool:
+    if not isinstance(summary, dict) or summary.get("status") != "completed":
+        return False
+    standings = summary.get("standings")
+    if not isinstance(standings, list) or not standings:
+        return False
+    games = [
+        int(row.get("games", 0))
+        for row in standings
+        if isinstance(row, dict)
+    ]
+    pair_results = summary.get("pair_results")
+    games_per_pairing = int(summary.get("games_per_pairing", 0))
+    openings_per_pairing = int(summary.get("openings_per_pairing", 0))
+    unique_openings_per_pairing = int(
+        summary.get("unique_openings_per_pairing", summary.get("unique_openings", 0))
+    )
+    return (
+        bool(games)
+        and min(games) >= TOURNAMENT_GAMES_PER_ENGINE
+        and games_per_pairing > 0
+        and games_per_pairing % 2 == 0
+        and openings_per_pairing >= games_per_pairing // 2
+        and unique_openings_per_pairing >= games_per_pairing // 2
+    )
+
+
 def standing_row(
     player: dict[str, object],
     scorecard: Scorecard,
@@ -2500,26 +2619,34 @@ def run_final_tournament(
     if not REFERENCE_BIN.is_file():
         raise SystemExit(f"latest release binary missing for tournament: {REFERENCE_BIN}")
 
-    openings = prepare_tournament_openings(OPENING_CONFIG)
-    opening_count = len(read_fen_lines(openings))
     players = [tournament_player_from_candidate(candidate) for candidate in selected]
     players.append(reference_tournament_player())
+    games_per_pairing = tournament_games_per_pairing(len(players))
+    paired_openings_per_pairing = games_per_pairing // 2
+    total_pairs = len(players) * (len(players) - 1) // 2
+    openings, tournament_openings = prepare_tournament_openings(
+        OPENING_CONFIG,
+        paired_openings_per_pairing,
+    )
+    opening_count = len(tournament_openings)
 
     emit_status(
         "tournament=start "
         f"players={len(players)} positive_nets={len(selected)} "
-        f"games_per_pairing={TOURNAMENT_GAMES_PER_PAIRING} "
-        f"openings={opening_count} "
+        f"games_per_pairing={games_per_pairing} "
+        f"target_games_per_engine={TOURNAMENT_GAMES_PER_ENGINE} "
+        f"unique_openings_per_pairing={opening_count} "
+        f"openings_per_pairing={paired_openings_per_pairing} "
         f"time_ms={MATCH_MS} "
-        f"parallel_matches={max(1, min(TOURNAMENT_PARALLEL_MATCHES, len(players) * (len(players) - 1) // 2))}"
+        f"parallel_matches={max(1, min(TOURNAMENT_PARALLEL_MATCHES, total_pairs))}"
     )
     stats = {str(player["id"]): Scorecard() for player in players}
     pair_results: list[dict[str, object]] = []
-    total_pairs = len(players) * (len(players) - 1) // 2
     pair_jobs: list[tuple[int, dict[str, object], dict[str, object]]] = []
     for left_index, left in enumerate(players):
         for right in players[left_index + 1 :]:
-            pair_jobs.append((len(pair_jobs) + 1, left, right))
+            pair_number = len(pair_jobs) + 1
+            pair_jobs.append((pair_number, left, right))
 
     def run_pair(
         job: tuple[int, dict[str, object], dict[str, object]],
@@ -2529,13 +2656,14 @@ def run_final_tournament(
             "tournament_pair=start "
             f"pair={pair_number}/{total_pairs} "
             f"left={left['name']} "
-            f"right={right['name']}"
+            f"right={right['name']} "
+            f"openings={paired_openings_per_pairing}"
         )
         match = match_runner(
             Path(str(left["source_bin"])),
             Path(str(right["source_bin"])),
             openings,
-            TOURNAMENT_GAMES_PER_PAIRING,
+            games_per_pairing,
             MATCH_MS,
             allow_local_failure=not bool(left["is_reference"]),
             allow_baseline_failure=not bool(right["is_reference"]),
@@ -2565,6 +2693,7 @@ def run_final_tournament(
                     "wdl_left": [match.wins, match.draws, match.losses],
                     "elo_left": match.elo,
                     "elo_95_ci": [match.elo_lower, match.elo_upper],
+                    "openings": paired_openings_per_pairing,
                 }
             )
     pair_results.sort(key=lambda row: int(row["pair"]))
@@ -2588,8 +2717,18 @@ def run_final_tournament(
         "status": "completed",
         "reference_ref": REFERENCE_REF,
         "positive_nets": len(selected),
-        "games_per_pairing": TOURNAMENT_GAMES_PER_PAIRING,
+        "games_per_pairing": games_per_pairing,
+        "target_games_per_engine": TOURNAMENT_GAMES_PER_ENGINE,
         "openings": opening_count,
+        "unique_openings": opening_count,
+        "unique_openings_per_pairing": opening_count,
+        "openings_per_pairing": paired_openings_per_pairing,
+        "opening_source": str(
+            OPENING_CONFIG.tournament_openings
+            if OPENING_CONFIG.tournament_openings_explicit
+            else OPENING_CONFIG.random_openings
+        ),
+        "opening_book": str(openings),
         "time_ms": MATCH_MS,
         "standings": standings,
         "pair_results": pair_results,
@@ -2746,6 +2885,20 @@ def cleanup_final_artifacts() -> None:
 def finish_training(state: RunState) -> None:
     if state.tournament_completed:
         summary = state.tournament_summary
+        if not tournament_summary_has_required_games(summary):
+            append_log(
+                "# tournament rerun required: completed summary does not meet "
+                f"{TOURNAMENT_GAMES_PER_ENGINE} games per engine"
+            )
+            state.tournament_completed = False
+            state.tournament_summary = None
+            state.tournament_results = None
+            state.training_data_export = None
+            state.save()
+            summary = None
+        else:
+            summary = state.tournament_summary
+    if state.tournament_completed:
         if summary is not None and summary.get("status") == "completed":
             standings = summary.get("standings")
             if isinstance(standings, list):
