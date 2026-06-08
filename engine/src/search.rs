@@ -28,13 +28,13 @@ const ROOT_REVERSE_MOVE_PENALTY: i32 = 200;
 const EMERGENCY_EJECTION_BONUS: i32 = 96;
 const ASPIRATION_WINDOW: i32 = 80;
 const LMR_MIN_DEPTH: u8 = 4;
-const LMR_MIN_MOVE_INDEX: usize = 4;
+const LMR_MIN_MOVE_INDEX: usize = 3;
 const LMR_DEPTH_DIVISOR: u8 = 5;
-const LMR_MOVE_DIVISOR: usize = 12;
+const LMR_MOVE_DIVISOR: usize = 16;
 const NULL_MOVE_REDUCTION: u8 = 3;
 const NULL_MOVE_MIN_DEPTH: u8 = 5;
-const FUTILITY_MARGIN_DEPTH1: i32 = 180;
-const FUTILITY_MARGIN_DEPTH2: i32 = 420;
+const FUTILITY_MARGIN_DEPTH1: i32 = 240;
+const FUTILITY_MARGIN_DEPTH2: i32 = 560;
 const USE_LATE_MOVE_PRUNING: bool = true;
 const EVAL_CACHE_WAYS: usize = 4;
 const COUNTERMOVE_TABLE_BITS: usize = 15;
@@ -1345,7 +1345,7 @@ impl Searcher {
                     &mut raw_static,
                 )
             });
-            if static_score.saturating_sub(70 + 70 * i32::from(depth)) >= beta {
+            if static_score.saturating_sub(90 + 90 * i32::from(depth)) >= beta {
                 return Ok(static_score);
             }
         }
@@ -1546,7 +1546,7 @@ impl Searcher {
             if USE_LATE_MOVE_PRUNING
                 && !self.terminal_horizon_requires_exact_search(ply, depth)
                 && ply > 0
-                && depth <= 4
+                && depth <= 5
                 && move_index >= 3 + depth as usize * depth as usize
                 && is_quiet
                 && history_score <= 0
