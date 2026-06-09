@@ -1316,13 +1316,15 @@ impl Searcher {
             }
         }
         if depth == 0 {
-            return Ok(self.corrected_eval(
+            return self.tactical_leaf_score(
                 position_state,
+                ply,
+                alpha,
+                beta,
+                history,
                 key,
-                self.turn_at_ply(ply),
-                history.current_no_progress(),
                 &mut raw_static,
-            ));
+            );
         }
         let static_score = if alpha > -WIN_SCORE / 2 && beta < WIN_SCORE / 2 {
             Some(self.corrected_eval(
@@ -1636,6 +1638,73 @@ impl Searcher {
         self.recycle_move_buffer(ply as usize, move_entries);
         Ok(best_score)
     }
+    fn tactical_leaf_score(
+        &mut self,
+        position_state: &mut PositionState,
+        ply: u8,
+        mut alpha: i32,
+        beta: i32,
+        history: &mut SearchHistory,
+        key: u64,
+        raw_static: &mut Option<i32>,
+    ) -> Result<i32, SearchAbort> {
+        let mut best = self.corrected_eval(
+            position_state,
+            key,
+            self.turn_at_ply(ply),
+            history.current_no_progress(),
+            raw_static,
+        );
+        if best >= beta || self.terminal_horizon_requires_exact_search(ply, 0) {
+            return Ok(best);
+        }
+        if best > alpha {
+            alpha = best;
+        }
+
+        let side = position_state.position().side_to_move();
+        let mut move_entries = self.take_move_buffer(ply as usize);
+        position_state.generate_fast_legal_moves(&mut move_entries);
+        move_entries.retain(|entry| entry.is_push);
+        self.order_moves(side, &mut move_entries, None, None, None, ply);
+
+        for move_entry in move_entries.iter().copied() {
+            self.check_abort()?;
+            self.push_move_entry(position_state, move_entry);
+            let undo = self.apply_move_entry(position_state, move_entry).unwrap();
+            let child_position_key = PositionKey::from_state(position_state);
+            history.push(child_position_key, move_entry.is_ejection);
+            let score = -terminal_score(
+                position_state.position(),
+                ply + 1,
+                self.turn_at_ply(ply + 1),
+            )
+            .unwrap_or_else(|| {
+                self.evaluate_position(
+                    position_state,
+                    self.turn_at_ply(ply + 1),
+                    history.current_no_progress(),
+                )
+            });
+            history.pop();
+            self.undo_move_entry(position_state, undo);
+            self.pop_acc();
+
+            if score > best {
+                best = score;
+            }
+            if score > alpha {
+                alpha = score;
+            }
+            if alpha >= beta {
+                break;
+            }
+        }
+
+        self.recycle_move_buffer(ply as usize, move_entries);
+        Ok(best)
+    }
+
     fn order_moves(
         &mut self,
         side: Color,

@@ -257,10 +257,30 @@ impl NnueModel {
             hidden_index += 1;
         }
         let dot = dot_i8_hidden(&quantized_hidden, &self.output_weights);
-        ((dot as f32 * self.act1 * self.output_scale + self.output_bias)
+        let nnue_score = ((dot as f32 * self.act1 * self.output_scale + self.output_bias)
             .clamp(-NNUE_MAX_OUT, NNUE_MAX_OUT)
             * NNUE_SCORE_LIMIT)
-            .round() as i32
+            .round() as i32;
+        let turn = turn_index.clamp(0.0, 350.0) as i32;
+        let remaining = (350 - turn).max(1);
+        let mut score = nnue_score;
+
+        let material = i32::from(shape.black.piece_count) - i32::from(shape.white.piece_count);
+        let material = if black_to_move { material } else { -material };
+        let center = i32::from(shape.black.edge) - i32::from(shape.white.edge);
+        let center = if black_to_move { center } else { -center };
+        let black_score = i32::from(Position::MAX_PIECES_PER_SIDE as u8 - shape.white.piece_count);
+        let white_score = i32::from(Position::MAX_PIECES_PER_SIDE as u8 - shape.black.piece_count);
+        let progress = black_score * black_score - white_score * white_score;
+        let progress = if black_to_move { progress } else { -progress };
+        let liberties = i32::from(shape.black.liberty_count) - i32::from(shape.white.liberty_count);
+        let liberties = if black_to_move { liberties } else { -liberties };
+
+        score = score.saturating_add(material.saturating_mul(4096 / remaining));
+        score = score.saturating_sub(center.saturating_mul(256 / remaining));
+        score = score.saturating_add(progress.saturating_mul(512 / remaining));
+        score = score.saturating_add(liberties.saturating_mul(256 / remaining));
+        score
     }
 }
 #[inline(always)]
