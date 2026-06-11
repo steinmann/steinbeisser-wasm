@@ -1367,7 +1367,7 @@ impl Searcher {
                 FUTILITY_MARGIN_DEPTH2
             };
             if static_score.saturating_add(margin) <= alpha {
-                return Ok(static_score);
+                return Ok(alpha);
             }
         }
         if allow_null
@@ -1506,7 +1506,7 @@ impl Searcher {
                 if let Some(raw) = raw_static {
                     self.update_correction_history(side, key, raw, score, depth);
                 }
-                return Ok(score);
+                return Ok(beta);
             }
             if is_quiet && priority_quiet_tried_count < priority_quiet_tried.len() {
                 priority_quiet_tried[priority_quiet_tried_count] = move_entry.history_key;
@@ -1613,7 +1613,7 @@ impl Searcher {
                     self.update_correction_history(side, key, raw, score, depth);
                 }
                 self.recycle_move_buffer(ply as usize, move_entries);
-                return Ok(score);
+                return Ok(beta);
             }
             if is_quiet && quiet_tried_count < quiet_tried.len() {
                 quiet_tried[quiet_tried_count] = move_entry.history_key;
