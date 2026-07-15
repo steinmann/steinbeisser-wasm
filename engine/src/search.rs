@@ -42,6 +42,7 @@ const COUNTERMOVE_TABLE_SIZE: usize = 1 << COUNTERMOVE_TABLE_BITS;
 const CORRECTION_HISTORY_BITS: usize = 14;
 const CORRECTION_HISTORY_SIZE: usize = 1 << CORRECTION_HISTORY_BITS;
 const COUNTERMOVE_ORDER_BONUS: i32 = 1750000;
+const FOLLOWUP_ORDER_BONUS: i32 = 1500000;
 const EJECTION_ORDER_BONUS: i32 = 1250000;
 const HISTORY_LMR_THRESHOLD: i32 = 512;
 const CORRECTION_HISTORY_CLAMP: i32 = 192;
@@ -466,9 +467,12 @@ pub(crate) struct Searcher {
     accumulators: Vec<NnueAccumulator>,
     feature_shapes: Vec<FeatureShape>,
     killers: Vec<[Option<Move>; 2]>,
+    static_eval_marks: Vec<Option<i32>>,
     history_scores: [Vec<i16>; 2],
     correction_history: [Vec<i16>; 2],
     countermoves: [Vec<u64>; 2],
+    followups: [Vec<u64>; 2],
+    path_keys: Vec<Option<u32>>,
     move_buffers: Vec<Vec<LegalMoveEntry>>,
     scored_move_buffers: Vec<Vec<(i32, LegalMoveEntry)>>,
     root_reverse_move: Option<Move>,
@@ -583,9 +587,15 @@ impl Searcher {
             accumulators: Vec::with_capacity(MAX_PLY + 2),
             feature_shapes: Vec::with_capacity(MAX_PLY + 2),
             killers: vec![[None, None]; MAX_PLY],
+            static_eval_marks: vec![None; MAX_PLY + 2],
             history_scores: shared.history_scores,
             correction_history: shared.correction_history,
             countermoves: shared.countermoves,
+            followups: [
+                vec![0; COUNTERMOVE_TABLE_SIZE],
+                vec![0; COUNTERMOVE_TABLE_SIZE],
+            ],
+            path_keys: Vec::with_capacity(MAX_PLY + 2),
             move_buffers: std::iter::repeat_with(|| Vec::with_capacity(64))
                 .take(MAX_PLY + 2)
                 .collect(),
@@ -762,6 +772,7 @@ impl Searcher {
         self.root_no_progress = no_progress_ply;
         self.accumulators.clear();
         self.feature_shapes.clear();
+        self.path_keys.clear();
         self.accumulators.push(nnue().root_accumulator(position));
         self.feature_shapes.push(build_feature_shape(
             position_state.black_bits(),
@@ -850,7 +861,7 @@ impl Searcher {
         position_state.generate_fast_legal_moves(&mut move_entries);
         for move_entry in move_entries.iter().copied() {
             let candidate_move = move_entry.candidate_move;
-            let order = self.move_order_score(side, move_entry, None, None, None, none_killers);
+            let order = self.move_order_score(side, move_entry, None, None, None, None, none_killers);
             self.push_move_entry(position_state, move_entry);
             let undo = self.apply_move_entry(position_state, move_entry).unwrap();
             let child_no_progress = if move_entry.is_ejection {
@@ -1004,7 +1015,7 @@ impl Searcher {
             self.push_move_entry(position_state, move_entry);
             let undo = self.apply_move_entry(position_state, move_entry).unwrap();
             let child_position_key = PositionKey::from_state(position_state);
-            history.push(child_position_key, move_entry.is_ejection);
+            history.push(child_position_key, move_entry.is_ejection); self.path_keys.push(Some(move_entry.history_key));
             let mut score = match self.search_move_score(
                 position_state,
                 depth,
@@ -1020,13 +1031,13 @@ impl Searcher {
             ) {
                 Ok(score) => score,
                 Err(error) => {
-                    history.pop();
+                    history.pop(); self.path_keys.pop();
                     self.undo_move_entry(position_state, undo);
                     self.pop_acc();
                     return Err(error);
                 }
             };
-            history.pop();
+            history.pop(); self.path_keys.pop();
             self.undo_move_entry(position_state, undo);
             self.pop_acc();
             if self.root_reverse_move == Some(candidate_move) {
@@ -1070,6 +1081,7 @@ impl Searcher {
             previous_best_move,
             transposition_move,
             None,
+            None,
             0,
         );
         if move_entries.is_empty() {
@@ -1095,7 +1107,7 @@ impl Searcher {
             self.push_move_entry(position_state, move_entry);
             let undo = self.apply_move_entry(position_state, move_entry).unwrap();
             let child_position_key = PositionKey::from_state(position_state);
-            history.push(child_position_key, move_entry.is_ejection);
+            history.push(child_position_key, move_entry.is_ejection); self.path_keys.push(Some(move_entry.history_key));
             let mut score = match self.search_move_score(
                 position_state,
                 depth,
@@ -1111,14 +1123,14 @@ impl Searcher {
             ) {
                 Ok(score) => score,
                 Err(error) => {
-                    history.pop();
+                    history.pop(); self.path_keys.pop();
                     self.undo_move_entry(position_state, undo);
                     self.pop_acc();
                     self.recycle_move_buffer(0, move_entries);
                     return Err(error);
                 }
             };
-            history.pop();
+            history.pop(); self.path_keys.pop();
             self.undo_move_entry(position_state, undo);
             self.pop_acc();
             if self.root_reverse_move == Some(candidate_move) {
@@ -1337,6 +1349,20 @@ impl Searcher {
         } else {
             None
         };
+        if let Some(slot) = self.static_eval_marks.get_mut(ply as usize) {
+            *slot = static_score;
+        }
+        let improving = ply >= 2
+            && match (
+                static_score,
+                self.static_eval_marks
+                    .get(ply as usize - 2)
+                    .copied()
+                    .flatten(),
+            ) {
+                (Some(current), Some(previous)) => current > previous,
+                _ => false,
+            };
         if !exact_terminal_horizon && ply > 0 && depth <= 4 {
             let static_score = static_score.unwrap_or_else(|| {
                 self.corrected_eval(
@@ -1347,7 +1373,7 @@ impl Searcher {
                     &mut raw_static,
                 )
             });
-            if static_score.saturating_sub(90 + 90 * i32::from(depth)) >= beta {
+            if static_score.saturating_sub(90 + 90 * i32::from(depth) - if improving { 90 } else { 0 }) >= beta {
                 return Ok(static_score);
             }
         }
@@ -1400,7 +1426,7 @@ impl Searcher {
                     .push(*self.feature_shapes.last().unwrap());
                 let previous_side_to_move = position_state.pass_turn();
                 let null_position_key = PositionKey::from_state(position_state);
-                history.push(null_position_key, false);
+                history.push(null_position_key, false); self.path_keys.push(None);
                 let null_score = -self.negamax(
                     position_state,
                     depth - 1 - null_reduction,
@@ -1411,7 +1437,7 @@ impl Searcher {
                     false,
                     None,
                 )?;
-                history.pop();
+                history.pop(); self.path_keys.pop();
                 position_state.restore_side_to_move(previous_side_to_move);
                 self.pop_acc();
                 if null_score >= beta {
@@ -1425,6 +1451,12 @@ impl Searcher {
             transposition_move = self.best_transposition_move(key, depth.saturating_sub(1));
         }
         let countermove_key = self.probe_countermove(side, previous_history_key);
+        let own_previous_key = if self.path_keys.len() >= 2 {
+            self.path_keys[self.path_keys.len() - 2]
+        } else {
+            None
+        };
+        let followup_key = self.probe_followup(side, own_previous_key);
         let original_alpha = alpha;
         let mut best_score = -SEARCH_SCORE_BOUND;
         let mut best_move = None;
@@ -1463,7 +1495,7 @@ impl Searcher {
             self.push_move_entry(position_state, move_entry);
             let undo = self.apply_move_entry(position_state, move_entry).unwrap();
             let child_position_key = PositionKey::from_state(position_state);
-            history.push(child_position_key, move_entry.is_ejection);
+            history.push(child_position_key, move_entry.is_ejection); self.path_keys.push(Some(move_entry.history_key));
             let score = self.search_move_score(
                 position_state,
                 depth,
@@ -1477,7 +1509,7 @@ impl Searcher {
                 is_ejection,
                 history_score,
             )?;
-            history.pop();
+            history.pop(); self.path_keys.pop();
             self.undo_move_entry(position_state, undo);
             self.pop_acc();
             if score > best_score {
@@ -1493,7 +1525,7 @@ impl Searcher {
                 if is_quiet {
                     self.record_killer(ply as usize, candidate_move);
                     self.reward_history(side, move_entry.history_key, depth);
-                    self.record_countermove(side, previous_history_key, move_entry.history_key);
+                    self.record_countermove(side, previous_history_key, move_entry.history_key); self.record_followup(side, own_previous_key, move_entry.history_key);
                     for history_key in priority_quiet_tried
                         .into_iter()
                         .take(priority_quiet_tried_count)
@@ -1538,6 +1570,7 @@ impl Searcher {
             None,
             transposition_move,
             countermove_key,
+            followup_key,
             ply,
         );
         let mut quiet_tried = [0u32; 64];
@@ -1559,7 +1592,7 @@ impl Searcher {
                 && !self.terminal_horizon_requires_exact_search(ply, depth)
                 && ply > 0
                 && depth <= 5
-                && move_index >= 3 + depth as usize * depth as usize
+                && move_index >= (3 + depth as usize * depth as usize) / (if improving { 1 } else { 2 })
                 && is_quiet
                 && history_score <= 0
                 && Some(candidate_move) != transposition_move
@@ -1572,7 +1605,7 @@ impl Searcher {
             self.push_move_entry(position_state, move_entry);
             let undo = self.apply_move_entry(position_state, move_entry).unwrap();
             let child_position_key = PositionKey::from_state(position_state);
-            history.push(child_position_key, move_entry.is_ejection);
+            history.push(child_position_key, move_entry.is_ejection); self.path_keys.push(Some(move_entry.history_key));
             let score = self.search_move_score(
                 position_state,
                 depth,
@@ -1586,7 +1619,7 @@ impl Searcher {
                 is_ejection,
                 history_score,
             )?;
-            history.pop();
+            history.pop(); self.path_keys.pop();
             self.undo_move_entry(position_state, undo);
             self.pop_acc();
             if score > best_score {
@@ -1600,7 +1633,7 @@ impl Searcher {
                 if is_quiet {
                     self.record_killer(ply as usize, candidate_move);
                     self.reward_history(side, move_entry.history_key, depth);
-                    self.record_countermove(side, previous_history_key, move_entry.history_key);
+                    self.record_countermove(side, previous_history_key, move_entry.history_key); self.record_followup(side, own_previous_key, move_entry.history_key);
                     for history_key in priority_quiet_tried
                         .into_iter()
                         .take(priority_quiet_tried_count)
@@ -1680,14 +1713,14 @@ impl Searcher {
         let mut move_entries = self.take_move_buffer(ply as usize);
         position_state.generate_fast_legal_moves(&mut move_entries);
         move_entries.retain(|entry| entry.is_push);
-        self.order_moves(side, &mut move_entries, None, None, None, ply);
+        self.order_moves(side, &mut move_entries, None, None, None, None, ply);
 
         for move_entry in move_entries.iter().copied() {
             self.check_abort()?;
             self.push_move_entry(position_state, move_entry);
             let undo = self.apply_move_entry(position_state, move_entry).unwrap();
             let child_position_key = PositionKey::from_state(position_state);
-            history.push(child_position_key, move_entry.is_ejection);
+            history.push(child_position_key, move_entry.is_ejection); self.path_keys.push(Some(move_entry.history_key));
             let score = -terminal_score(
                 position_state.position(),
                 ply + 1,
@@ -1700,7 +1733,7 @@ impl Searcher {
                     history.current_no_progress(),
                 )
             });
-            history.pop();
+            history.pop(); self.path_keys.pop();
             self.undo_move_entry(position_state, undo);
             self.pop_acc();
 
@@ -1726,6 +1759,7 @@ impl Searcher {
         principal_variation_move: Option<Move>,
         transposition_move: Option<Move>,
         countermove_key: Option<u32>,
+        followup_key: Option<u32>,
         ply: u8,
     ) {
         let killers = self
@@ -1742,6 +1776,7 @@ impl Searcher {
                     principal_variation_move,
                     transposition_move,
                     countermove_key,
+                    followup_key,
                     killers,
                 ),
                 move_entry,
@@ -1766,6 +1801,7 @@ impl Searcher {
         principal_variation_move: Option<Move>,
         transposition_move: Option<Move>,
         countermove_key: Option<u32>,
+        followup_key: Option<u32>,
         killers: [Option<Move>; 2],
     ) -> i32 {
         let candidate_move = move_entry.candidate_move;
@@ -1783,6 +1819,9 @@ impl Searcher {
         }
         if Some(move_entry.history_key) == countermove_key {
             return COUNTERMOVE_ORDER_BONUS + self.history_score(side, move_entry.history_key);
+        }
+        if Some(move_entry.history_key) == followup_key {
+            return FOLLOWUP_ORDER_BONUS + self.history_score(side, move_entry.history_key);
         }
         if move_entry.is_ejection {
             return EJECTION_ORDER_BONUS + self.history_score(side, move_entry.history_key);
@@ -1838,6 +1877,26 @@ impl Searcher {
         let index = previous_history_key as usize & (COUNTERMOVE_TABLE_SIZE - 1);
         self.countermoves[side_index(side)][index] =
             (u64::from(previous_history_key) << 32) | u64::from(reply_key.saturating_add(1));
+    }
+    fn probe_followup(&self, side: Color, own_previous_key: Option<u32>) -> Option<u32> {
+        let own_previous_key = own_previous_key?;
+        let entry = self.followups[side_index(side)]
+            [own_previous_key as usize & (COUNTERMOVE_TABLE_SIZE - 1)];
+        let stored_previous = (entry >> 32) as u32;
+        let stored_reply = entry as u32;
+        if stored_previous == own_previous_key && stored_reply != 0 {
+            Some(stored_reply - 1)
+        } else {
+            None
+        }
+    }
+    fn record_followup(&mut self, side: Color, own_previous_key: Option<u32>, reply_key: u32) {
+        let Some(own_previous_key) = own_previous_key else {
+            return;
+        };
+        let index = own_previous_key as usize & (COUNTERMOVE_TABLE_SIZE - 1);
+        self.followups[side_index(side)][index] =
+            (u64::from(own_previous_key) << 32) | u64::from(reply_key.saturating_add(1));
     }
     fn current_shape(&mut self, position_state: &PositionState) -> &FeatureShape {
         let _ = position_state;
