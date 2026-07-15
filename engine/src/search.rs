@@ -1351,6 +1351,7 @@ impl Searcher {
                 return Ok(static_score);
             }
         }
+        let mut futility_prune_quiets = false;
         if !exact_terminal_horizon && depth <= 2 && alpha > -WIN_SCORE / 2 && beta < WIN_SCORE / 2 {
             let static_score = static_score.unwrap_or_else(|| {
                 self.corrected_eval(
@@ -1367,7 +1368,7 @@ impl Searcher {
                 FUTILITY_MARGIN_DEPTH2
             };
             if static_score.saturating_add(margin) <= alpha {
-                return Ok(alpha);
+                futility_prune_quiets = true;
             }
         }
         if allow_null
@@ -1427,6 +1428,7 @@ impl Searcher {
         let original_alpha = alpha;
         let mut best_score = -SEARCH_SCORE_BOUND;
         let mut best_move = None;
+        let mut searched_move = false;
         let killers = self
             .killers
             .get(ply as usize)
@@ -1447,6 +1449,10 @@ impl Searcher {
                 continue;
             };
             self.check_abort()?;
+            if futility_prune_quiets && !move_entry.is_push {
+                continue;
+            }
+            searched_move = true;
             let is_ejection = move_entry.is_ejection;
             let is_quiet = !is_ejection;
             let history_score = if is_quiet {
@@ -1545,6 +1551,10 @@ impl Searcher {
             } else {
                 0
             };
+            if futility_prune_quiets && !move_entry.is_push {
+                continue;
+            }
+            searched_move = true;
             if USE_LATE_MOVE_PRUNING
                 && !self.terminal_horizon_requires_exact_search(ply, depth)
                 && ply > 0
@@ -1619,6 +1629,10 @@ impl Searcher {
                 quiet_tried[quiet_tried_count] = move_entry.history_key;
                 quiet_tried_count += 1;
             }
+        }
+        if futility_prune_quiets && !searched_move {
+            self.recycle_move_buffer(ply as usize, move_entries);
+            return Ok(alpha);
         }
         self.store_transposition(TranspositionEntry {
             key,
