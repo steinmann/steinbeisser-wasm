@@ -1203,8 +1203,8 @@ fn write_fen_samples_binary(path: &Path, games: &[(String, PlayedGame)]) -> Resu
                 Outcome::Win(_, _) => -1.0,
             };
             samples.push(BinarySample {
-                black_bits: bitboard(state.position.black()),
-                white_bits: bitboard(state.position.white()),
+                black_bits: state.position.black_bits(),
+                white_bits: state.position.white_bits(),
                 side_to_move_is_black: row.side == Color::Black,
                 ply: row.ply as f32,
                 no_progress_plies: row.no_progress as f32,
@@ -1222,12 +1222,6 @@ fn write_fen_samples_binary(path: &Path, games: &[(String, PlayedGame)]) -> Resu
         }
     }
     sample::write_samples(path, &samples).map_err(|error| format!("{}: {error}", path.display()))
-}
-
-fn bitboard(cells: &[board::CellId]) -> u64 {
-    cells
-        .iter()
-        .fold(0_u64, |bits, cell| bits | (1_u64 << cell.as_u8()))
 }
 
 fn board_text(position: &Position) -> String {

@@ -2288,8 +2288,8 @@ impl PositionKey {
     pub(crate) fn from_position(position: &Position) -> Self {
         Self {
             side_to_move: position.side_to_move(),
-            black_bits: bits(position.black()),
-            white_bits: bits(position.white()),
+            black_bits: position.black_bits(),
+            white_bits: position.white_bits(),
         }
     }
     fn from_state(position_state: &PositionState) -> Self {
@@ -2424,11 +2424,6 @@ fn store_transposition_bucket(
         bucket[replacement] = Some(entry);
     }
 }
-fn bits(cs: &[crate::board::CellId]) -> u64 {
-    cs.iter().fold(0u64, |accumulator, cell| {
-        accumulator | (1u64 << cell.as_u8())
-    })
-}
 fn position_hash(position_key: PositionKey) -> u64 {
     splitmix64(
         position_key.black_bits
@@ -2515,8 +2510,8 @@ fn side_index(side: Color) -> usize {
     }
 }
 fn terminal_score(position: &Position, ply: u8, turn_index: u16) -> Option<i32> {
-    let black = position.black().len();
-    let white = position.white().len();
+    let black = position.marble_count(Color::Black);
+    let white = position.marble_count(Color::White);
     let winner = if white <= 8 {
         Some(Color::Black)
     } else if black <= 8 {

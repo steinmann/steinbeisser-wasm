@@ -209,10 +209,10 @@ fn bits(pos: &Position, sym: Symmetry) -> (u64, u64) {
     let mut black = 0u64;
     let mut white = 0u64;
     for cell in pos.black() {
-        black |= 1u64 << geometry().transform(*cell, sym).as_u8();
+        black |= 1u64 << geometry().transform(cell, sym).as_u8();
     }
     for cell in pos.white() {
-        white |= 1u64 << geometry().transform(*cell, sym).as_u8();
+        white |= 1u64 << geometry().transform(cell, sym).as_u8();
     }
     (black, white)
 }

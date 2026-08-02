@@ -236,8 +236,101 @@ impl LineAxis {
 
 pub const BOARD_RADIUS: i8 = 4;
 pub const CELL_COUNT: usize = 61;
+pub const BOARD_MASK: u64 = (1u64 << CELL_COUNT) - 1;
 pub const LINE_COUNT_PER_AXIS: usize = 9;
 pub const SYMMETRY_COUNT: usize = 12;
+
+/// A compact, ascending view over a set of board cells.
+///
+/// `Position` uses bitboards as its sole source of truth. This value type keeps
+/// common piece-list operations allocation-free while providing an easy
+/// compatibility bridge for callers that still need a `Vec<CellId>`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct CellSet {
+    bits: u64,
+}
+impl CellSet {
+    /// Creates a cell set, ignoring bits outside the 61-cell board.
+    ///
+    /// Use [`Position::from_bitboards`] when out-of-board bits should be
+    /// rejected instead of masked.
+    pub const fn from_bits(bits: u64) -> Self {
+        Self {
+            bits: bits & BOARD_MASK,
+        }
+    }
+    pub const fn bits(self) -> u64 {
+        self.bits
+    }
+    pub const fn len(self) -> usize {
+        self.bits.count_ones() as usize
+    }
+    pub const fn is_empty(self) -> bool {
+        self.bits == 0
+    }
+    pub const fn contains(self, cell: CellId) -> bool {
+        self.bits & (1u64 << cell.as_u8()) != 0
+    }
+    pub const fn iter(self) -> CellIter {
+        CellIter {
+            remaining: self.bits,
+        }
+    }
+    pub fn to_vec(self) -> Vec<CellId> {
+        self.iter().collect()
+    }
+}
+impl IntoIterator for CellSet {
+    type Item = CellId;
+    type IntoIter = CellIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+impl IntoIterator for &CellSet {
+    type Item = CellId;
+    type IntoIter = CellIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CellIter {
+    remaining: u64,
+}
+impl Iterator for CellIter {
+    type Item = CellId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let index = self.remaining.trailing_zeros() as u8;
+        self.remaining &= self.remaining - 1;
+        Some(CellId::new_unchecked(index))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.remaining.count_ones() as usize;
+        (len, Some(len))
+    }
+}
+impl DoubleEndedIterator for CellIter {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let index = 63 - self.remaining.leading_zeros() as u8;
+        self.remaining &= !(1u64 << index);
+        Some(CellId::new_unchecked(index))
+    }
+}
+impl ExactSizeIterator for CellIter {}
+impl std::iter::FusedIterator for CellIter {}
+
 static GEOMETRY: OnceLock<Geometry> = OnceLock::new();
 pub fn geometry() -> &'static Geometry {
     GEOMETRY.get_or_init(Geometry::build)
@@ -705,111 +798,155 @@ fn validate_contiguous_group(source_cells: &[CellId]) -> Result<(), MoveError> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct Position {
+    black: u64,
+    white: u64,
     side_to_move: Color,
-    black: Vec<CellId>,
-    white: Vec<CellId>,
 }
 impl Position {
     pub const MAX_PIECES_PER_SIDE: usize = 14;
     pub fn new(
         side_to_move: Color,
-        black: Vec<CellId>,
-        white: Vec<CellId>,
+        mut black: Vec<CellId>,
+        mut white: Vec<CellId>,
     ) -> Result<Self, PositionError> {
-        let mut record = Self {
-            side_to_move,
+        let black = Self::bits_from_cells(Color::Black, &mut black)?;
+        let white = Self::bits_from_cells(Color::White, &mut white)?;
+        Self::from_bitboards(side_to_move, black, white)
+    }
+    pub fn from_bitboards(
+        side_to_move: Color,
+        black: u64,
+        white: u64,
+    ) -> Result<Self, PositionError> {
+        let position = Self {
             black,
             white,
+            side_to_move,
         };
-        record.normalize();
-        record.validate()?;
-        Ok(record)
+        position.validate()?;
+        Ok(position)
     }
-    pub fn side_to_move(&self) -> Color {
+    pub const fn side_to_move(&self) -> Color {
         self.side_to_move
     }
-    pub fn black(&self) -> &[CellId] {
-        &self.black
+    pub const fn black(&self) -> CellSet {
+        CellSet::from_bits(self.black)
     }
-    pub fn white(&self) -> &[CellId] {
-        &self.white
+    pub const fn white(&self) -> CellSet {
+        CellSet::from_bits(self.white)
     }
-    pub(crate) fn cells_for_mut(&mut self, color: Color) -> &mut Vec<CellId> {
+    pub const fn black_bits(&self) -> u64 {
+        self.black
+    }
+    pub const fn white_bits(&self) -> u64 {
+        self.white
+    }
+    pub const fn occupied_bits(&self) -> u64 {
+        self.black | self.white
+    }
+    pub const fn cells(&self, color: Color) -> CellSet {
+        CellSet::from_bits(self.bits_for(color))
+    }
+    pub const fn bits_for(&self, color: Color) -> u64 {
         match color {
-            Color::Black => &mut self.black,
-            Color::White => &mut self.white,
+            Color::Black => self.black,
+            Color::White => self.white,
         }
     }
     pub(crate) fn set_side_to_move(&mut self, side_to_move: Color) {
         self.side_to_move = side_to_move;
     }
-    pub fn contains(&self, color: Color, cell: CellId) -> bool {
-        self.cells_for(color).binary_search(&cell).is_ok()
+    pub(crate) fn apply_masks(
+        &mut self,
+        side: Color,
+        own_from: u64,
+        own_to: u64,
+        enemy_from: u64,
+        enemy_to: u64,
+    ) {
+        match side {
+            Color::Black => {
+                self.black = (self.black & !own_from) | own_to;
+                self.white = (self.white & !enemy_from) | enemy_to;
+            }
+            Color::White => {
+                self.white = (self.white & !own_from) | own_to;
+                self.black = (self.black & !enemy_from) | enemy_to;
+            }
+        }
+        self.side_to_move = side.other();
+        debug_assert_eq!((self.black | self.white) & !BOARD_MASK, 0);
+        debug_assert_eq!(self.black & self.white, 0);
     }
-    pub fn occupant(&self, cell: CellId) -> Option<Color> {
-        if self.black.binary_search(&cell).is_ok() {
+    pub const fn contains(&self, color: Color, cell: CellId) -> bool {
+        self.bits_for(color) & (1u64 << cell.as_u8()) != 0
+    }
+    pub const fn occupant(&self, cell: CellId) -> Option<Color> {
+        let bit = 1u64 << cell.as_u8();
+        if self.black & bit != 0 {
             Some(Color::Black)
-        } else if self.white.binary_search(&cell).is_ok() {
+        } else if self.white & bit != 0 {
             Some(Color::White)
         } else {
             None
         }
     }
-    pub fn marble_count(&self, color: Color) -> usize {
-        self.cells_for(color).len()
+    pub const fn marble_count(&self, color: Color) -> usize {
+        self.bits_for(color).count_ones() as usize
     }
     pub fn transform(&self, symmetry: Symmetry) -> Self {
         let geometry = geometry();
-        let black = self
-            .black
-            .iter()
-            .copied()
-            .map(|cell| geometry.transform(cell, symmetry))
-            .collect();
-        let white = self
-            .white
-            .iter()
-            .copied()
-            .map(|cell| geometry.transform(cell, symmetry))
-            .collect();
-        Self::new(self.side_to_move, black, white).unwrap()
+        let transform_bits = |cells: CellSet| {
+            cells.into_iter().fold(0u64, |bits, cell| {
+                bits | (1u64 << geometry.transform(cell, symmetry).as_u8())
+            })
+        };
+        Self {
+            black: transform_bits(self.black()),
+            white: transform_bits(self.white()),
+            side_to_move: self.side_to_move,
+        }
     }
     pub fn validate(&self) -> Result<(), PositionError> {
-        Self::validate_color_list(Color::Black, &self.black)?;
-        Self::validate_color_list(Color::White, &self.white)?;
-        for black in &self.black {
-            if self.white.binary_search(black).is_ok() {
-                return Err(PositionError::CellOverlap(black.coord()));
-            }
+        let outside = (self.black | self.white) & !BOARD_MASK;
+        if outside != 0 {
+            return Err(PositionError::CellsOutsideBoard(outside));
+        }
+        Self::validate_color_bits(Color::Black, self.black)?;
+        Self::validate_color_bits(Color::White, self.white)?;
+        let overlap = self.black & self.white;
+        if overlap != 0 {
+            let cell = CellId::new_unchecked(overlap.trailing_zeros() as u8);
+            return Err(PositionError::CellOverlap(cell.coord()));
         }
         Ok(())
     }
     pub fn canonical_string(&self) -> String {
         self.to_string()
     }
-    fn normalize(&mut self) {
-        self.black.sort_unstable();
-        self.white.sort_unstable();
-    }
-    fn cells_for(&self, color: Color) -> &[CellId] {
-        match color {
-            Color::Black => &self.black,
-            Color::White => &self.white,
-        }
-    }
-    fn validate_color_list(color: Color, cells: &[CellId]) -> Result<(), PositionError> {
+    fn bits_from_cells(color: Color, cells: &mut [CellId]) -> Result<u64, PositionError> {
         if cells.len() > Self::MAX_PIECES_PER_SIDE {
             return Err(PositionError::TooManyPieces {
                 color,
                 count: cells.len(),
             });
         }
+        cells.sort_unstable();
         for pair in cells.windows(2) {
             if pair[0] >= pair[1] {
                 return Err(PositionError::NonCanonicalCellOrder(color));
             }
+        }
+        Ok(cells
+            .iter()
+            .fold(0u64, |bits, cell| bits | (1u64 << cell.as_u8())))
+    }
+    fn validate_color_bits(color: Color, bits: u64) -> Result<(), PositionError> {
+        let count = bits.count_ones() as usize;
+        if count > Self::MAX_PIECES_PER_SIDE {
+            return Err(PositionError::TooManyPieces { color, count });
         }
         Ok(())
     }
@@ -923,8 +1060,10 @@ impl fmt::Display for Position {
             Color::Black => 'b',
             Color::White => 'w',
         };
-        let white_ejected = Self::MAX_PIECES_PER_SIDE.saturating_sub(self.white.len());
-        let black_ejected = Self::MAX_PIECES_PER_SIDE.saturating_sub(self.black.len());
+        let white_ejected =
+            Self::MAX_PIECES_PER_SIDE.saturating_sub(self.marble_count(Color::White));
+        let black_ejected =
+            Self::MAX_PIECES_PER_SIDE.saturating_sub(self.marble_count(Color::Black));
         write!(
             f,
             "{} 0 0 {} {} {}",
@@ -965,6 +1104,7 @@ pub enum PositionError {
     InvalidFenRowLength { row: char, expected: u8, actual: u8 },
     InvalidFenCell { row: char, cell: char },
     TooManyPieces { color: Color, count: usize },
+    CellsOutsideBoard(u64),
     CellOverlap(Coord),
     NonCanonicalCellOrder(Color),
 }
@@ -983,6 +1123,9 @@ impl fmt::Display for PositionError {
                 write!(f, "fen row {row} has invalid cell {cell}")
             }
             Self::TooManyPieces { color, count } => write!(f, "{color} has {count} marbles"),
+            Self::CellsOutsideBoard(bits) => {
+                write!(f, "position has cells outside the board: {bits:#018x}")
+            }
             Self::CellOverlap(coord) => write!(f, "both sides occupy {coord}"),
             Self::NonCanonicalCellOrder(color) => write!(f, "{color} cells are not canonical"),
         }

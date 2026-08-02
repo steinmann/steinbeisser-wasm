@@ -152,10 +152,10 @@ impl NnueModel {
             white: self.baseline_accumulator,
         };
         for cell in position.black() {
-            self.apply_sparse_delta(&mut accumulator, Color::Black, *cell, 1);
+            self.apply_sparse_delta(&mut accumulator, Color::Black, cell, 1);
         }
         for cell in position.white() {
-            self.apply_sparse_delta(&mut accumulator, Color::White, *cell, 1);
+            self.apply_sparse_delta(&mut accumulator, Color::White, cell, 1);
         }
         accumulator
     }

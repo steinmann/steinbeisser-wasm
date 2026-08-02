@@ -88,11 +88,11 @@ impl SessionState {
     }
 
     pub fn black_count(&self) -> usize {
-        self.position.black().len()
+        self.position.marble_count(Color::Black)
     }
 
     pub fn white_count(&self) -> usize {
-        self.position.white().len()
+        self.position.marble_count(Color::White)
     }
 
     pub fn to_dto(&self) -> SessionDto {
@@ -242,12 +242,10 @@ fn parse_cells(values: &[String]) -> Result<Vec<CellId>, String> {
 }
 
 fn canonicalize_position(position: &Position) -> Result<Position, String> {
-    Position::new(
-        position.side_to_move(),
-        position.black().to_vec(),
-        position.white().to_vec(),
-    )
-    .map_err(|_| "failed to canonicalize position".to_owned())
+    position
+        .validate()
+        .map_err(|_| "failed to canonicalize position".to_owned())?;
+    Ok(*position)
 }
 
 fn result_win(winner: Color, reason: &str) -> GameResultDto {
@@ -271,16 +269,16 @@ pub fn detect_result(
     _history_positions: &[Position],
     turn_index: u16,
 ) -> Option<GameResultDto> {
-    if position.black().len() <= 8 {
+    if position.marble_count(Color::Black) <= 8 {
         return Some(result_win(Color::White, "black_marbles_reduced_to_eight"));
     }
-    if position.white().len() <= 8 {
+    if position.marble_count(Color::White) <= 8 {
         return Some(result_win(Color::Black, "white_marbles_reduced_to_eight"));
     }
 
     if turn_index >= MAX_GAME_TURNS {
-        let black = position.black().len();
-        let white = position.white().len();
+        let black = position.marble_count(Color::Black);
+        let white = position.marble_count(Color::White);
         if black > white {
             return Some(result_win(Color::Black, "max_turns_material_advantage"));
         }
