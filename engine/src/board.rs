@@ -880,6 +880,21 @@ impl Position {
         debug_assert_eq!((self.black | self.white) & !BOARD_MASK, 0);
         debug_assert_eq!(self.black & self.white, 0);
     }
+    pub(crate) fn apply_toggle_masks(&mut self, own_toggle: u64, enemy_toggle: u64) {
+        match self.side_to_move {
+            Color::Black => {
+                self.black ^= own_toggle;
+                self.white ^= enemy_toggle;
+            }
+            Color::White => {
+                self.white ^= own_toggle;
+                self.black ^= enemy_toggle;
+            }
+        }
+        self.side_to_move = self.side_to_move.other();
+        debug_assert_eq!((self.black | self.white) & !BOARD_MASK, 0);
+        debug_assert_eq!(self.black & self.white, 0);
+    }
     pub const fn contains(&self, color: Color, cell: CellId) -> bool {
         self.bits_for(color) & (1u64 << cell.as_u8()) != 0
     }

@@ -159,6 +159,7 @@ impl NnueModel {
         }
         accumulator
     }
+    #[cfg_attr(target_arch = "aarch64", allow(unsafe_code))]
     pub(crate) fn apply_sparse_delta(
         &self,
         accumulator: &mut NnueAccumulator,
@@ -177,13 +178,56 @@ impl NnueModel {
         } else {
             raw
         };
-        let mut feature_index = 0;
-        while feature_index < SPARSE_FEATURE_COUNT {
-            accumulator.black[feature_index] += delta
-                * i32::from(self.sparse_weights[black_row * SPARSE_FEATURE_COUNT + feature_index]);
-            accumulator.white[feature_index] += delta
-                * i32::from(self.sparse_weights[white_row * SPARSE_FEATURE_COUNT + feature_index]);
-            feature_index += 1;
+        let black_base = black_row * SPARSE_FEATURE_COUNT;
+        let white_base = white_row * SPARSE_FEATURE_COUNT;
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut feature_index = 0usize;
+            // SAFETY: each base starts an in-range weight row, and the loop
+            // condition leaves at least four elements for every load/store.
+            unsafe {
+                use std::arch::aarch64::*;
+                let delta = vdupq_n_s32(delta);
+                while feature_index + 4 <= SPARSE_FEATURE_COUNT {
+                    let black_weights = vmovl_s16(vld1_s16(
+                        self.sparse_weights.as_ptr().add(black_base + feature_index),
+                    ));
+                    let white_weights = vmovl_s16(vld1_s16(
+                        self.sparse_weights.as_ptr().add(white_base + feature_index),
+                    ));
+                    let black_accumulator =
+                        vld1q_s32(accumulator.black.as_ptr().add(feature_index));
+                    let white_accumulator =
+                        vld1q_s32(accumulator.white.as_ptr().add(feature_index));
+                    vst1q_s32(
+                        accumulator.black.as_mut_ptr().add(feature_index),
+                        vmlaq_s32(black_accumulator, black_weights, delta),
+                    );
+                    vst1q_s32(
+                        accumulator.white.as_mut_ptr().add(feature_index),
+                        vmlaq_s32(white_accumulator, white_weights, delta),
+                    );
+                    feature_index += 4;
+                }
+            }
+            while feature_index < SPARSE_FEATURE_COUNT {
+                accumulator.black[feature_index] +=
+                    delta * i32::from(self.sparse_weights[black_base + feature_index]);
+                accumulator.white[feature_index] +=
+                    delta * i32::from(self.sparse_weights[white_base + feature_index]);
+                feature_index += 1;
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut feature_index = 0;
+            while feature_index < SPARSE_FEATURE_COUNT {
+                accumulator.black[feature_index] +=
+                    delta * i32::from(self.sparse_weights[black_base + feature_index]);
+                accumulator.white[feature_index] +=
+                    delta * i32::from(self.sparse_weights[white_base + feature_index]);
+                feature_index += 1;
+            }
         }
     }
     pub(crate) fn evaluate_with_accumulator_bits(
@@ -285,23 +329,79 @@ impl NnueModel {
 }
 #[inline(always)]
 fn dot_i8_sparse_hidden(left: &[i8; NNUE_H0_PAD], right: &[i8]) -> i32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        assert_eq!(right.len(), NNUE_H0_PAD);
+        // SAFETY: the emitted module requires SIMD and unsupported runtimes
+        // reject it before this call. Both inputs contain exactly NNUE_H0_PAD
+        // bytes, a multiple of one v128 load.
+        return unsafe { dot_i8_wasm_simd::<NNUE_H0_PAD>(left.as_ptr(), right.as_ptr()) };
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    dot_i8_scalar::<NNUE_H0_PAD>(left, right)
+}
+#[inline(always)]
+fn dot_i8_hidden(left: &[i8; NNUE_H1_PAD], right: &[i8]) -> i32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        assert_eq!(right.len(), NNUE_H1_PAD);
+        // SAFETY: see dot_i8_sparse_hidden. NNUE_H1_PAD is also a multiple
+        // of one v128 load and both inputs contain that many bytes.
+        return unsafe { dot_i8_wasm_simd::<NNUE_H1_PAD>(left.as_ptr(), right.as_ptr()) };
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    dot_i8_scalar::<NNUE_H1_PAD>(left, right)
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+fn dot_i8_scalar<const LEN: usize>(left: &[i8; LEN], right: &[i8]) -> i32 {
     let mut dot = 0i32;
     let mut index = 0usize;
-    while index < NNUE_H0_PAD {
+    while index < LEN {
         dot += i32::from(left[index]) * i32::from(right[index]);
         index += 1;
     }
     dot
 }
-#[inline(always)]
-fn dot_i8_hidden(left: &[i8; NNUE_H1_PAD], right: &[i8]) -> i32 {
-    let mut dot = 0i32;
+
+#[cfg(target_arch = "wasm32")]
+#[target_feature(enable = "simd128")]
+#[allow(unsafe_code)]
+unsafe fn dot_i8_wasm_simd<const LEN: usize>(left: *const i8, right: *const i8) -> i32 {
+    use core::arch::wasm32::*;
+
+    assert_eq!(LEN % 16, 0);
+    let mut sums = i32x4_splat(0);
     let mut index = 0usize;
-    while index < NNUE_H1_PAD {
-        dot += i32::from(left[index]) * i32::from(right[index]);
-        index += 1;
+    while index < LEN {
+        // SAFETY: callers guarantee LEN readable bytes at both pointers, and
+        // the loop advances in complete 16-byte chunks while index < LEN.
+        let (left_bytes, right_bytes) = unsafe {
+            (
+                v128_load(left.add(index).cast::<v128>()),
+                v128_load(right.add(index).cast::<v128>()),
+            )
+        };
+        sums = i32x4_add(
+            sums,
+            i32x4_dot_i16x8(
+                i16x8_extend_low_i8x16(left_bytes),
+                i16x8_extend_low_i8x16(right_bytes),
+            ),
+        );
+        sums = i32x4_add(
+            sums,
+            i32x4_dot_i16x8(
+                i16x8_extend_high_i8x16(left_bytes),
+                i16x8_extend_high_i8x16(right_bytes),
+            ),
+        );
+        index += 16;
     }
-    dot
+    i32x4_extract_lane::<0>(sums)
+        + i32x4_extract_lane::<1>(sums)
+        + i32x4_extract_lane::<2>(sums)
+        + i32x4_extract_lane::<3>(sums)
 }
 pub(crate) fn nnue() -> &'static NnueModel {
     static MODEL: OnceLock<NnueModel> = OnceLock::new();

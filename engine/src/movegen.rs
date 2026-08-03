@@ -17,6 +17,41 @@ pub enum MoveApplicationError {
     InvalidMoveShape(MoveError),
     InvalidPosition(PositionError),
 }
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct CompactEnemyEffect(u16);
+impl CompactEnemyEffect {
+    const CELL_CODE_MASK: u16 = 0x3f;
+
+    const fn none() -> Self {
+        Self(0)
+    }
+    fn from_toggle_mask(mut toggle: u64) -> Self {
+        debug_assert!(toggle.count_ones() <= 2);
+        let mut encoded = 0u16;
+        if toggle != 0 {
+            encoded = toggle.trailing_zeros() as u16 + 1;
+            toggle &= toggle - 1;
+        }
+        if toggle != 0 {
+            encoded |= (toggle.trailing_zeros() as u16 + 1) << 6;
+            toggle &= toggle - 1;
+        }
+        debug_assert_eq!(toggle, 0);
+        Self(encoded)
+    }
+    pub(crate) fn toggle_mask(self) -> u64 {
+        let first = self.0 & Self::CELL_CODE_MASK;
+        let second = (self.0 >> 6) & Self::CELL_CODE_MASK;
+        let mut toggle = 0u64;
+        if first != 0 {
+            toggle |= 1u64 << (first - 1);
+        }
+        if second != 0 {
+            toggle |= 1u64 << (second - 1);
+        }
+        toggle
+    }
+}
 impl PositionState {
     pub fn new(position: Position) -> Result<Self, PositionError> {
         position.validate()?;
@@ -66,13 +101,15 @@ impl PositionState {
                 continue;
             }
             for direction in group.directions.iter().flatten() {
-                let Some((is_push, is_ejection)) = self.fast_group_direction_legality(
-                    group.len as usize,
-                    direction,
-                    side_bits,
-                    enemy_bits,
-                    occupied_bits,
-                ) else {
+                let Some((is_push, is_ejection, enemy_effect)) = self
+                    .fast_group_direction_legality(
+                        group.len as usize,
+                        direction,
+                        side_bits,
+                        enemy_bits,
+                        occupied_bits,
+                    )
+                else {
                     continue;
                 };
                 moves.push(crate::search::LegalMoveEntry {
@@ -80,6 +117,8 @@ impl PositionState {
                     is_ejection,
                     is_push,
                     history_key: direction.history_key,
+                    plan_index: direction.plan_index,
+                    enemy_effect,
                 });
             }
         }
@@ -94,7 +133,7 @@ impl PositionState {
         side_bits: u64,
         enemy_bits: u64,
         occupied_bits: u64,
-    ) -> Option<(bool, bool)> {
+    ) -> Option<(bool, bool, CompactEnemyEffect)> {
         if direction.inline {
             self.fast_inline_legality(len, direction, side_bits, enemy_bits, occupied_bits)
         } else {
@@ -105,9 +144,9 @@ impl PositionState {
         &self,
         translated_mask: u64,
         occupied_bits: u64,
-    ) -> Option<(bool, bool)> {
+    ) -> Option<(bool, bool, CompactEnemyEffect)> {
         if occupied_bits & translated_mask == 0 {
-            Some((false, false))
+            Some((false, false, CompactEnemyEffect::none()))
         } else {
             None
         }
@@ -119,10 +158,10 @@ impl PositionState {
         side_bits: u64,
         enemy_bits: u64,
         occupied_bits: u64,
-    ) -> Option<(bool, bool)> {
+    ) -> Option<(bool, bool, CompactEnemyEffect)> {
         let first_bit = direction.ray_bits[0];
         if occupied_bits & first_bit == 0 {
-            return Some((false, false));
+            return Some((false, false, CompactEnemyEffect::none()));
         }
         if side_bits & first_bit != 0 {
             return None;
@@ -142,13 +181,18 @@ impl PositionState {
         }
         match direction.landing[enemy_count - 1] {
             Some(cell) => {
-                if occupied_bits & (1u64 << cell.as_u8()) != 0 {
+                let landing_bit = 1u64 << cell.as_u8();
+                if occupied_bits & landing_bit != 0 {
                     None
                 } else {
-                    Some((true, false))
+                    Some((
+                        true,
+                        false,
+                        CompactEnemyEffect::from_toggle_mask(first_bit | landing_bit),
+                    ))
                 }
             }
-            None => Some((true, true)),
+            None => Some((true, true, CompactEnemyEffect::from_toggle_mask(first_bit))),
         }
     }
     pub fn apply_move(
@@ -162,19 +206,38 @@ impl PositionState {
         apply_plan_in_place(&mut self.position, &plan);
         Ok(undo)
     }
+    pub(crate) fn apply_legal_effect(
+        &mut self,
+        plan_index: u16,
+        enemy_effect: CompactEnemyEffect,
+    ) -> UndoSnapshot {
+        let undo = UndoSnapshot {
+            previous_position: self.position,
+        };
+        let own_toggle = crate::search::fast_movegen_tables().own_toggle(plan_index);
+        self.position
+            .apply_toggle_masks(own_toggle, enemy_effect.toggle_mask());
+        undo
+    }
     pub(crate) fn legal_move_entry(
         &self,
         candidate_move: &Move,
     ) -> Option<crate::search::LegalMoveEntry> {
         let plan = self.analyze_move(candidate_move).ok()?;
+        let history_key = crate::search::history_group_key(
+            candidate_move.source_cells(),
+            candidate_move.direction(),
+        );
+        let tables = crate::search::fast_movegen_tables();
+        let plan_index = tables.plan_index(history_key)?;
+        debug_assert_eq!(tables.own_toggle(plan_index), plan.own_toggle());
         Some(crate::search::LegalMoveEntry {
             candidate_move: *candidate_move,
             is_ejection: plan.is_ejection(),
             is_push: plan.is_push(),
-            history_key: crate::search::history_group_key(
-                candidate_move.source_cells(),
-                candidate_move.direction(),
-            ),
+            history_key,
+            plan_index,
+            enemy_effect: plan.enemy_effect(),
         })
     }
     pub fn undo_move(&mut self, undo: UndoSnapshot) {
@@ -237,6 +300,12 @@ impl MovePlan {
     }
     const fn is_ejection(self) -> bool {
         self.enemy_from.count_ones() > self.enemy_to.count_ones()
+    }
+    const fn own_toggle(self) -> u64 {
+        self.own_from ^ self.own_to
+    }
+    fn enemy_effect(self) -> CompactEnemyEffect {
+        CompactEnemyEffect::from_toggle_mask(self.enemy_from ^ self.enemy_to)
     }
 }
 fn enumerate_groups(position: &Position, side: Color) -> Vec<Vec<crate::board::CellId>> {

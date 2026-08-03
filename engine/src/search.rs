@@ -574,6 +574,12 @@ impl Searcher {
         } else {
             PersistentContext::new_with_tt_size(transposition_table_size)
         };
+        let mut history_scores = shared.history_scores;
+        for table in &mut history_scores {
+            for score in table {
+                *score = (i32::from(*score) * 7 / 8) as i16;
+            }
+        }
         Self {
             config,
             deadline,
@@ -588,7 +594,7 @@ impl Searcher {
             feature_shapes: Vec::with_capacity(MAX_PLY + 2),
             killers: vec![[None, None]; MAX_PLY],
             static_eval_marks: vec![None; MAX_PLY + 2],
-            history_scores: shared.history_scores,
+            history_scores,
             correction_history: shared.correction_history,
             countermoves: shared.countermoves,
             followups: [
@@ -1065,6 +1071,7 @@ impl Searcher {
                     score: encode_tt_score(score, 0),
                     bound: BoundKind::Lower,
                     best_move: Some(candidate_move),
+                    exact_terminal: self.terminal_horizon_requires_exact_search(0, depth),
                 });
                 return Ok((score, Some(candidate_move)));
             }
@@ -1157,6 +1164,7 @@ impl Searcher {
                     score: encode_tt_score(score, 0),
                     bound: BoundKind::Lower,
                     best_move: Some(candidate_move),
+                    exact_terminal: self.terminal_horizon_requires_exact_search(0, depth),
                 });
                 self.recycle_move_buffer(0, move_entries);
                 return Ok((score, Some(candidate_move)));
@@ -1173,6 +1181,7 @@ impl Searcher {
                 BoundKind::Exact
             },
             best_move: best_move,
+            exact_terminal: self.terminal_horizon_requires_exact_search(0, depth),
         });
         self.recycle_move_buffer(0, move_entries);
         Ok((best_score, best_move))
@@ -1285,8 +1294,9 @@ impl Searcher {
         let mut raw_static = None;
         if let Some(entry) = self.probe_transposition(key, depth) {
             let score = decode_tt_score(entry.score, ply);
+            let tt_cutoffs_allowed = !exact_terminal_horizon || entry.exact_terminal;
             match entry.bound {
-                BoundKind::Exact if !exact_terminal_horizon => {
+                BoundKind::Exact if tt_cutoffs_allowed => {
                     self.update_tt_cutoff_correction(
                         position_state,
                         key,
@@ -1298,8 +1308,8 @@ impl Searcher {
                     );
                     return Ok(score);
                 }
-                BoundKind::Lower if !exact_terminal_horizon => alpha = alpha.max(score),
-                BoundKind::Upper if !exact_terminal_horizon && score <= alpha => {
+                BoundKind::Lower if tt_cutoffs_allowed => alpha = alpha.max(score),
+                BoundKind::Upper if tt_cutoffs_allowed && score <= alpha => {
                     self.update_tt_cutoff_correction(
                         position_state,
                         key,
@@ -1311,10 +1321,10 @@ impl Searcher {
                     );
                     return Ok(score);
                 }
-                BoundKind::Upper if !exact_terminal_horizon => beta = beta.min(score),
+                BoundKind::Upper if tt_cutoffs_allowed => beta = beta.min(score),
                 _ => {}
             }
-            if alpha >= beta && !exact_terminal_horizon {
+            if alpha >= beta && tt_cutoffs_allowed {
                 self.update_tt_cutoff_correction(
                     position_state,
                     key,
@@ -1540,6 +1550,7 @@ impl Searcher {
                     score: encode_tt_score(score, ply),
                     bound: BoundKind::Lower,
                     best_move: Some(candidate_move),
+                    exact_terminal: exact_terminal_horizon,
                 });
                 if let Some(raw) = raw_static {
                     self.update_correction_history(side, key, raw, score, depth);
@@ -1651,6 +1662,7 @@ impl Searcher {
                     score: encode_tt_score(score, ply),
                     bound: BoundKind::Lower,
                     best_move: Some(candidate_move),
+                    exact_terminal: exact_terminal_horizon,
                 });
                 if let Some(raw) = raw_static {
                     self.update_correction_history(side, key, raw, score, depth);
@@ -1663,7 +1675,7 @@ impl Searcher {
                 quiet_tried_count += 1;
             }
         }
-        if futility_prune_quiets && !searched_move {
+        if best_move.is_none() {
             self.recycle_move_buffer(ply as usize, move_entries);
             return Ok(alpha);
         }
@@ -1678,6 +1690,7 @@ impl Searcher {
                 BoundKind::Exact
             },
             best_move: best_move,
+            exact_terminal: exact_terminal_horizon,
         });
         if let Some(raw) = raw_static {
             self.update_correction_history(side, key, raw, best_score, depth);
@@ -1850,7 +1863,10 @@ impl Searcher {
         let malus = i16::try_from(i32::from(depth) * i32::from(depth)).unwrap_or(i16::MAX);
         {
             let slot = &mut self.history_scores[side_index(side)][history_key as usize];
-            *slot = slot.saturating_sub(malus);
+            let slot_value = i32::from(*slot);
+            let malus_value = i32::from(malus);
+            let updated = slot_value - malus_value - ((slot_value * malus_value) / 16384);
+            *slot = updated.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
         }
     }
     fn probe_countermove(&self, side: Color, previous_history_key: Option<u32>) -> Option<u32> {
@@ -1902,97 +1918,61 @@ impl Searcher {
         let _ = position_state;
         self.feature_shapes.last().unwrap()
     }
-    fn push_move_state(&mut self, position_state: &PositionState, candidate_move: Move) {
+    fn push_move_state(&mut self, position_state: &PositionState, move_entry: LegalMoveEntry) {
         let model = nnue();
         let mut next = self.accumulators.last().cloned().unwrap();
         let mut shape = *self.feature_shapes.last().unwrap();
         let position = position_state.position();
         let side = position.side_to_move();
-        let mut own_from = 0u64;
-        let mut own_to = 0u64;
-        let mut enemy_from = 0u64;
-        let mut enemy_to = 0u64;
-        for cell in candidate_move.source_cells() {
-            let bit = 1u64 << cell.as_u8();
-            own_from |= bit;
-            model.apply_sparse_delta(&mut next, side, *cell, -1);
-            let destination = neighbor_cell(*cell, candidate_move.direction()).unwrap();
-            own_to |= 1u64 << destination.as_u8();
-            model.apply_sparse_delta(&mut next, side, destination, 1);
-        }
-        if candidate_move.len() > 1 {
-            if let Some(axis) = move_group_axis(candidate_move.source_cells()) {
-                if move_is_inline(axis, candidate_move.direction()) {
-                    if let Some(front) =
-                        move_front_cell(candidate_move.source_cells(), candidate_move.direction())
-                    {
-                        if let Some(first_enemy_cell) =
-                            neighbor_cell(front, candidate_move.direction())
-                        {
-                            let position_key = side.other();
-                            let mut cursor = Some(first_enemy_cell);
-                            while let Some(cell) = cursor {
-                                let occupant = position_state.occupant_fast(cell);
-                                if occupant != Some(position_key) {
-                                    break;
-                                }
-                                enemy_from |= 1u64 << cell.as_u8();
-                                model.apply_sparse_delta(&mut next, position_key, cell, -1);
-                                let destination = neighbor_cell(cell, candidate_move.direction());
-                                if let Some(destination) = destination {
-                                    enemy_to |= 1u64 << destination.as_u8();
-                                    model.apply_sparse_delta(
-                                        &mut next,
-                                        position_key,
-                                        destination,
-                                        1,
-                                    );
-                                }
-                                cursor = destination;
-                            }
-                        }
-                    }
-                }
+        let own_bits = position.bits_for(side);
+        let enemy_bits = position.bits_for(side.other());
+        let own_toggle = fast_movegen_tables().own_toggle(move_entry.plan_index);
+        let enemy_toggle = move_entry.enemy_effect.toggle_mask();
+        for (color, before, toggle) in [
+            (side, own_bits, own_toggle),
+            (side.other(), enemy_bits, enemy_toggle),
+        ] {
+            let mut removed = before & toggle;
+            while removed != 0 {
+                let cell = crate::board::CellId::new_unchecked(removed.trailing_zeros() as u8);
+                model.apply_sparse_delta(&mut next, color, cell, -1);
+                removed &= removed - 1;
+            }
+            let mut added = !before & toggle;
+            while added != 0 {
+                let cell = crate::board::CellId::new_unchecked(added.trailing_zeros() as u8);
+                model.apply_sparse_delta(&mut next, color, cell, 1);
+                added &= added - 1;
             }
         }
+        let own_after = own_bits ^ own_toggle;
+        let enemy_after = enemy_bits ^ enemy_toggle;
         self.accumulators.push(next);
         match side {
             Color::Black => {
-                shape.black = update_side_feature_shape(
-                    shape.black,
-                    position_state.black_bits(),
-                    (position_state.black_bits() & !own_from) | own_to,
-                );
-                shape.white = update_side_feature_shape(
-                    shape.white,
-                    position_state.white_bits(),
-                    (position_state.white_bits() & !enemy_from) | enemy_to,
-                );
+                shape.black = update_side_feature_shape(shape.black, own_bits, own_after);
+                shape.white = update_side_feature_shape(shape.white, enemy_bits, enemy_after);
             }
             Color::White => {
-                shape.white = update_side_feature_shape(
-                    shape.white,
-                    position_state.white_bits(),
-                    (position_state.white_bits() & !own_from) | own_to,
-                );
-                shape.black = update_side_feature_shape(
-                    shape.black,
-                    position_state.black_bits(),
-                    (position_state.black_bits() & !enemy_from) | enemy_to,
-                );
+                shape.white = update_side_feature_shape(shape.white, own_bits, own_after);
+                shape.black = update_side_feature_shape(shape.black, enemy_bits, enemy_after);
             }
         }
         self.feature_shapes.push(shape);
     }
     fn push_move_entry(&mut self, position_state: &PositionState, move_entry: LegalMoveEntry) {
-        self.push_move_state(position_state, move_entry.candidate_move);
+        self.push_move_state(position_state, move_entry);
     }
     fn apply_move_entry(
         &mut self,
         position_state: &mut PositionState,
         move_entry: LegalMoveEntry,
     ) -> Result<UndoSnapshot, MoveApplicationError> {
-        position_state.apply_move(&move_entry.candidate_move)
+        debug_assert_eq!(
+            position_state.legal_move_entry(&move_entry.candidate_move),
+            Some(move_entry)
+        );
+        Ok(position_state.apply_legal_effect(move_entry.plan_index, move_entry.enemy_effect))
     }
     fn undo_move_entry(&mut self, position_state: &mut PositionState, undo: UndoSnapshot) {
         position_state.undo_move(undo);
@@ -2146,6 +2126,7 @@ pub(crate) struct FastGroupDirection {
     pub(crate) inline: bool,
     pub(crate) translated_mask: u64,
     pub(crate) history_key: u32,
+    pub(crate) plan_index: u16,
     pub(crate) ray_bits: [u64; 3],
     pub(crate) landing: [Option<crate::board::CellId>; 2],
 }
@@ -2158,6 +2139,23 @@ pub(crate) struct FastSourceGroup {
 #[derive(Clone, Debug)]
 pub(crate) struct FastMovegenTables {
     pub(crate) source_groups: Vec<FastSourceGroup>,
+    plans: Vec<FastMovePlan>,
+    plan_lookup: Vec<(u32, u16)>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FastMovePlan {
+    own_toggle: u64,
+}
+impl FastMovegenTables {
+    pub(crate) fn own_toggle(&self, plan_index: u16) -> u64 {
+        self.plans[plan_index as usize].own_toggle
+    }
+    pub(crate) fn plan_index(&self, history_key: u32) -> Option<u16> {
+        self.plan_lookup
+            .binary_search_by_key(&history_key, |entry| entry.0)
+            .ok()
+            .map(|index| self.plan_lookup[index].1)
+    }
 }
 pub(crate) fn fast_movegen_tables() -> &'static FastMovegenTables {
     static TABLES: std::sync::OnceLock<FastMovegenTables> = std::sync::OnceLock::new();
@@ -2166,12 +2164,15 @@ pub(crate) fn fast_movegen_tables() -> &'static FastMovegenTables {
 fn build_fast_movegen_tables() -> FastMovegenTables {
     let geom = geometry();
     let mut source_groups = Vec::with_capacity(256);
+    let mut plans = Vec::with_capacity(2048);
     for cell in geom.cells().iter().map(|cell| cell.index) {
         let cells = [cell, cell, cell];
+        let source_mask = 1u64 << cell.as_u8();
+        let directions = build_fast_group_directions(&cells, 1, None, source_mask, &mut plans);
         source_groups.push(FastSourceGroup {
             len: 1,
-            source_mask: 1u64 << cell.as_u8(),
-            directions: build_fast_group_directions(&cells, 1, None),
+            source_mask,
+            directions,
         });
     }
     for axis in [LineAxis::Q, LineAxis::R, LineAxis::S] {
@@ -2182,21 +2183,42 @@ fn build_fast_movegen_tables() -> FastMovegenTables {
                 }
                 for start in 0..=line.cells.len() - len {
                     let cells = canonical_group_cells(&line.cells[start..start + len]);
+                    let source_mask = fast_source_mask(&cells, len as u8);
+                    let directions = build_fast_group_directions(
+                        &cells,
+                        len as u8,
+                        Some(axis),
+                        source_mask,
+                        &mut plans,
+                    );
                     source_groups.push(FastSourceGroup {
                         len: len as u8,
-                        source_mask: fast_source_mask(&cells, len as u8),
-                        directions: build_fast_group_directions(&cells, len as u8, Some(axis)),
+                        source_mask,
+                        directions,
                     });
                 }
             }
         }
     }
-    FastMovegenTables { source_groups }
+    let mut plan_lookup = source_groups
+        .iter()
+        .flat_map(|group| group.directions.iter().flatten())
+        .map(|direction| (direction.history_key, direction.plan_index))
+        .collect::<Vec<_>>();
+    plan_lookup.sort_unstable_by_key(|entry| entry.0);
+    debug_assert!(plan_lookup.windows(2).all(|pair| pair[0].0 != pair[1].0));
+    FastMovegenTables {
+        source_groups,
+        plans,
+        plan_lookup,
+    }
 }
 fn build_fast_group_directions(
     cells: &[crate::board::CellId; 3],
     len: u8,
     axis: Option<LineAxis>,
+    source_mask: u64,
+    plans: &mut Vec<FastMovePlan>,
 ) -> [Option<FastGroupDirection>; 6] {
     std::array::from_fn(|dir_idx| {
         let direction = ALL_DIRECTIONS[dir_idx];
@@ -2235,11 +2257,16 @@ fn build_fast_group_directions(
             }
             current = geometry().cell(cell).neighbors[direction.index()];
         }
+        let plan_index = u16::try_from(plans.len()).expect("fast move plan count fits u16");
+        plans.push(FastMovePlan {
+            own_toggle: source_mask ^ translated_mask,
+        });
         Some(FastGroupDirection {
             candidate_move: Move::new_unchecked(group, direction),
             inline,
             translated_mask,
             history_key: history_group_key(group, direction),
+            plan_index,
             ray_bits,
             landing,
         })
@@ -2277,6 +2304,8 @@ pub(crate) struct LegalMoveEntry {
     pub(crate) is_ejection: bool,
     pub(crate) is_push: bool,
     pub(crate) history_key: u32,
+    pub(crate) plan_index: u16,
+    pub(crate) enemy_effect: crate::movegen::CompactEnemyEffect,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PositionKey {
@@ -2314,6 +2343,7 @@ struct TranspositionEntry {
     score: i32,
     bound: BoundKind,
     best_move: Option<Move>,
+    exact_terminal: bool,
 }
 #[derive(Clone)]
 struct TranspositionTable {
