@@ -54,6 +54,7 @@ const HISTORY_SOURCE_GROUPS_LEN3: usize = combination_count(crate::board::CELL_C
 const HISTORY_SOURCE_GROUP_COUNT: usize =
     HISTORY_SOURCE_GROUPS_LEN1 + HISTORY_SOURCE_GROUPS_LEN2 + HISTORY_SOURCE_GROUPS_LEN3;
 const HISTORY_TABLE_SIZE: usize = HISTORY_SOURCE_GROUP_COUNT * 6;
+const HISTORY_SCORE_TABLE_SIZE: usize = 1734;
 const EVAL_CACHE_SEED: u64 = 0xA5A55A5A1F2E3D4C;
 const SEARCH_CONTEXT_KEY_SEED: u64 = 0xC6A4A7935BD1E995;
 const NO_PROGRESS_KEY_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -191,7 +192,10 @@ impl PersistentContext {
             generation: 1,
             transposition_table: TranspositionTable::new(transposition_table_size),
             eval_cache: EvalCache::new(EVAL_CACHE_SIZE),
-            history_scores: [vec![0; HISTORY_TABLE_SIZE], vec![0; HISTORY_TABLE_SIZE]],
+            history_scores: [
+                vec![0; HISTORY_SCORE_TABLE_SIZE],
+                vec![0; HISTORY_SCORE_TABLE_SIZE],
+            ],
             correction_history: [
                 vec![0; CORRECTION_HISTORY_SIZE],
                 vec![0; CORRECTION_HISTORY_SIZE],
@@ -667,7 +671,10 @@ impl Searcher {
             eval_cache: std::mem::replace(&mut self.eval_cache, EvalCache::new(EVAL_CACHE_SIZE)),
             history_scores: std::mem::replace(
                 &mut self.history_scores,
-                [vec![0; HISTORY_TABLE_SIZE], vec![0; HISTORY_TABLE_SIZE]],
+                [
+                    vec![0; HISTORY_SCORE_TABLE_SIZE],
+                    vec![0; HISTORY_SCORE_TABLE_SIZE],
+                ],
             ),
             correction_history: std::mem::replace(
                 &mut self.correction_history,
@@ -801,13 +808,10 @@ impl Searcher {
             best_result.score = terminal_score(position, 0, self.turn_at_ply(0)).unwrap_or(0);
             return Ok((best_result, self.diagnostics));
         }
+        self.advance_generation();
         let mut previous_best_move = best_result.best_move;
         let mut previous_score = best_result.score;
         for depth in 1..=u8::MAX {
-            self.generation = self.generation.wrapping_add(1);
-            if self.generation == 0 {
-                self.generation = 1;
-            }
             if !self.admit_depth(
                 depth,
                 best_result.depth,
@@ -1014,7 +1018,7 @@ impl Searcher {
             let is_ejection = move_entry.is_ejection;
             let is_quiet = !is_ejection;
             let history_score = if is_quiet {
-                self.history_score(side, move_entry.history_key)
+                self.history_score(side, move_entry.plan_index)
             } else {
                 0
             };
@@ -1061,7 +1065,7 @@ impl Searcher {
             if alpha >= beta {
                 if is_quiet {
                     self.record_killer(0, candidate_move);
-                    self.reward_history(side, move_entry.history_key, depth);
+                    self.reward_history(side, move_entry.plan_index, depth);
                     self.record_countermove(side, None, move_entry.history_key);
                 }
                 self.store_root_transposition(TranspositionEntry {
@@ -1107,7 +1111,7 @@ impl Searcher {
             let is_ejection = move_entry.is_ejection;
             let is_quiet = !is_ejection;
             let history_score = if is_quiet {
-                self.history_score(side, move_entry.history_key)
+                self.history_score(side, move_entry.plan_index)
             } else {
                 0
             };
@@ -1154,7 +1158,7 @@ impl Searcher {
             if alpha >= beta {
                 if is_quiet {
                     self.record_killer(0, candidate_move);
-                    self.reward_history(side, move_entry.history_key, depth);
+                    self.reward_history(side, move_entry.plan_index, depth);
                     self.record_countermove(side, None, move_entry.history_key);
                 }
                 self.store_root_transposition(TranspositionEntry {
@@ -1478,7 +1482,7 @@ impl Searcher {
             .unwrap_or([None, None]);
         let mut priority_count = 0usize;
         let mut priority_moves = [None; 4];
-        let mut priority_quiet_tried = [0u32; 4];
+        let mut priority_quiet_tried = [0u16; 4];
         let mut priority_quiet_tried_count = 0usize;
         for candidate_move in [transposition_move, killers[0], killers[1], None]
             .into_iter()
@@ -1498,7 +1502,7 @@ impl Searcher {
             let is_ejection = move_entry.is_ejection;
             let is_quiet = !is_ejection;
             let history_score = if is_quiet {
-                self.history_score(side, move_entry.history_key)
+                self.history_score(side, move_entry.plan_index)
             } else {
                 0
             };
@@ -1534,7 +1538,7 @@ impl Searcher {
             if alpha >= beta {
                 if is_quiet {
                     self.record_killer(ply as usize, candidate_move);
-                    self.reward_history(side, move_entry.history_key, depth);
+                    self.reward_history(side, move_entry.plan_index, depth);
                     self.record_countermove(side, previous_history_key, move_entry.history_key); self.record_followup(side, own_previous_key, move_entry.history_key);
                     for history_key in priority_quiet_tried
                         .into_iter()
@@ -1558,7 +1562,7 @@ impl Searcher {
                 return Ok(beta);
             }
             if is_quiet && priority_quiet_tried_count < priority_quiet_tried.len() {
-                priority_quiet_tried[priority_quiet_tried_count] = move_entry.history_key;
+                priority_quiet_tried[priority_quiet_tried_count] = move_entry.plan_index;
                 priority_quiet_tried_count += 1;
             }
         }
@@ -1584,14 +1588,14 @@ impl Searcher {
             followup_key,
             ply,
         );
-        let mut quiet_tried = [0u32; 64];
+        let mut quiet_tried = [0u16; 64];
         let mut quiet_tried_count = 0usize;
         for (move_index, move_entry) in move_entries.iter().copied().enumerate() {
             let candidate_move = move_entry.candidate_move;
             let is_ejection = move_entry.is_ejection;
             let is_quiet = !is_ejection;
             let history_score = if is_quiet {
-                self.history_score(side, move_entry.history_key)
+                self.history_score(side, move_entry.plan_index)
             } else {
                 0
             };
@@ -1643,7 +1647,7 @@ impl Searcher {
             if alpha >= beta {
                 if is_quiet {
                     self.record_killer(ply as usize, candidate_move);
-                    self.reward_history(side, move_entry.history_key, depth);
+                    self.reward_history(side, move_entry.plan_index, depth);
                     self.record_countermove(side, previous_history_key, move_entry.history_key); self.record_followup(side, own_previous_key, move_entry.history_key);
                     for history_key in priority_quiet_tried
                         .into_iter()
@@ -1671,7 +1675,7 @@ impl Searcher {
                 return Ok(beta);
             }
             if is_quiet && quiet_tried_count < quiet_tried.len() {
-                quiet_tried[quiet_tried_count] = move_entry.history_key;
+                quiet_tried[quiet_tried_count] = move_entry.plan_index;
                 quiet_tried_count += 1;
             }
         }
@@ -1831,38 +1835,38 @@ impl Searcher {
             return 1000000;
         }
         if Some(move_entry.history_key) == countermove_key {
-            return COUNTERMOVE_ORDER_BONUS + self.history_score(side, move_entry.history_key);
+            return COUNTERMOVE_ORDER_BONUS + self.history_score(side, move_entry.plan_index);
         }
         if Some(move_entry.history_key) == followup_key {
-            return FOLLOWUP_ORDER_BONUS + self.history_score(side, move_entry.history_key);
+            return FOLLOWUP_ORDER_BONUS + self.history_score(side, move_entry.plan_index);
         }
         if move_entry.is_ejection {
-            return EJECTION_ORDER_BONUS + self.history_score(side, move_entry.history_key);
+            return EJECTION_ORDER_BONUS + self.history_score(side, move_entry.plan_index);
         }
         if move_entry.is_push {
             return PUSH_ORDER_BONUS
                 + i32::try_from(move_entry.candidate_move.len()).unwrap_or(0) * 10000
-                + self.history_score(side, move_entry.history_key);
+                + self.history_score(side, move_entry.plan_index);
         }
-        self.history_score(side, move_entry.history_key)
+        self.history_score(side, move_entry.plan_index)
     }
-    fn history_score(&self, side: Color, history_key: u32) -> i32 {
-        i32::from(self.history_scores[side_index(side)][history_key as usize])
+    fn history_score(&self, side: Color, plan_index: u16) -> i32 {
+        i32::from(self.history_scores[side_index(side)][plan_index as usize])
     }
-    fn reward_history(&mut self, side: Color, history_key: u32, depth: u8) {
+    fn reward_history(&mut self, side: Color, plan_index: u16, depth: u8) {
         let bonus = i16::try_from(i32::from(depth) * i32::from(depth)).unwrap_or(i16::MAX);
         {
-            let slot = &mut self.history_scores[side_index(side)][history_key as usize];
+            let slot = &mut self.history_scores[side_index(side)][plan_index as usize];
             let slot_value = i32::from(*slot);
             let bonus_value = i32::from(bonus);
             let updated = slot_value + bonus_value - ((slot_value * bonus_value) / 16384);
             *slot = updated.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
         }
     }
-    fn penalize_history(&mut self, side: Color, history_key: u32, depth: u8) {
+    fn penalize_history(&mut self, side: Color, plan_index: u16, depth: u8) {
         let malus = i16::try_from(i32::from(depth) * i32::from(depth)).unwrap_or(i16::MAX);
         {
-            let slot = &mut self.history_scores[side_index(side)][history_key as usize];
+            let slot = &mut self.history_scores[side_index(side)][plan_index as usize];
             let slot_value = i32::from(*slot);
             let malus_value = i32::from(malus);
             let updated = slot_value - malus_value - ((slot_value * malus_value) / 16384);
