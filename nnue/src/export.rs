@@ -19,6 +19,7 @@ struct ExportTrainingArgs {
     summary: PathBuf,
     out_dir: PathBuf,
     work_dir: PathBuf,
+    corpus_dir: Option<PathBuf>,
     reference_ref: String,
 }
 
@@ -73,6 +74,7 @@ where
     let mut summary = None::<PathBuf>;
     let mut out_dir = None::<PathBuf>;
     let mut work_dir = None::<PathBuf>;
+    let mut corpus_dir = None::<PathBuf>;
     let mut reference_ref = None::<String>;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
@@ -82,11 +84,14 @@ where
             "--work-dir" => {
                 work_dir = Some(PathBuf::from(required_value(&mut args, "--work-dir")?))
             }
+            "--corpus-dir" => {
+                corpus_dir = Some(PathBuf::from(required_value(&mut args, "--corpus-dir")?))
+            }
             "--reference-ref" => {
                 reference_ref = Some(required_value(&mut args, "--reference-ref")?)
             }
             _ => bail!(
-                "unknown argument {flag}; usage: nnue export-positive-training-data --summary <summary.json> --out-dir <dir> --work-dir <dir> --reference-ref <ref>"
+                "unknown argument {flag}; usage: nnue export-positive-training-data --summary <summary.json> --out-dir <dir> --work-dir <dir> [--corpus-dir <dir>] --reference-ref <ref>"
             ),
         }
     }
@@ -94,6 +99,7 @@ where
         summary: summary.ok_or_else(|| anyhow::anyhow!("missing required --summary"))?,
         out_dir: out_dir.ok_or_else(|| anyhow::anyhow!("missing required --out-dir"))?,
         work_dir: work_dir.ok_or_else(|| anyhow::anyhow!("missing required --work-dir"))?,
+        corpus_dir,
         reference_ref: reference_ref
             .ok_or_else(|| anyhow::anyhow!("missing required --reference-ref"))?,
     })
@@ -142,7 +148,21 @@ fn export_training_data(summary: &Value, args: &ExportTrainingArgs) -> Result<Va
         .get("standings")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("completed tournament summary is missing standings"))?;
-    let positive_rows = standings
+    let reference_rows = standings
+        .iter()
+        .filter(|row| {
+            row.get("is_reference")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    let [reference_row] = reference_rows.as_slice() else {
+        bail!(
+            "completed tournament must contain exactly one reference row, found {}",
+            reference_rows.len()
+        );
+    };
+    let candidate_rows = standings
         .iter()
         .filter(|row| {
             !row.get("is_reference")
@@ -150,29 +170,46 @@ fn export_training_data(summary: &Value, args: &ExportTrainingArgs) -> Result<Va
                 .unwrap_or(false)
         })
         .collect::<Vec<_>>();
-    if positive_rows.is_empty() {
+    if candidate_rows.is_empty() {
         return Ok(json!({
             "status": "skipped",
-            "reason": "no_positive_screen_hits",
+            "reason": "no_candidate_rows",
             "reference_ref": args.reference_ref,
             "tournament": summary,
         }));
     }
 
-    let source_row = tournament_winner(&positive_rows)?;
-    let source_corpus = candidate_corpus_dir(source_row, &args.work_dir)?;
+    let source_row = tournament_winner(&candidate_rows)?;
+    let release_candidate =
+        f64_field(source_row, "elo_vs_latest") > f64_field(reference_row, "elo_vs_latest");
+    let source_corpus = match &args.corpus_dir {
+        Some(path) => path.clone(),
+        None => candidate_corpus_dir(source_row, &args.work_dir)?,
+    };
+    let corpus_manifest = CorpusManifest::read(&source_corpus.join("manifest.json"))?;
+    let winner_train_prefix_samples = int_field(source_row, "train_samples");
+    if corpus_manifest.train.samples < winner_train_prefix_samples.max(0) as usize {
+        bail!(
+            "full corpus has {} training samples, fewer than winner prefix {}",
+            corpus_manifest.train.samples,
+            winner_train_prefix_samples
+        );
+    }
     copy_training_corpus(&source_corpus, &args.out_dir)?;
     let export = json!({
-        "status": "completed",
+        "status": if release_candidate { "completed" } else { "retained" },
+        "release_candidate": release_candidate,
         "training_dir": args.out_dir.display().to_string(),
         "reference_ref": args.reference_ref,
         "winner_player": source_row.get("player").cloned().unwrap_or(Value::Null),
         "winner_model": source_row.get("model").cloned().unwrap_or(Value::Null),
         "source_corpus_dir": source_corpus.display().to_string(),
-        "train_prefix_samples": int_field(source_row, "train_samples"),
+        "train_prefix_samples": winner_train_prefix_samples,
+        "corpus_train_samples": corpus_manifest.train.samples,
+        "validation_samples": corpus_manifest.val.samples,
         "tournament_elo_vs_latest": f64_field(source_row, "elo_vs_latest"),
         "qval_loss": f64_field(source_row, "qval_loss"),
-        "files": ["train.sbin", "val.sbin", "network.nnq", "elo_screen.png", "elo_tournament.png"],
+        "files": ["train.sbin", "val.sbin", "manifest.json"],
     });
     Ok(export)
 }
@@ -188,7 +225,7 @@ fn tournament_winner<'a>(rows: &[&'a Value]) -> Result<&'a Value> {
                 })
                 .then_with(|| int_field(left, "games").cmp(&int_field(right, "games")))
         })
-        .ok_or_else(|| anyhow::anyhow!("completed tournament has no positive candidate rows"))
+        .ok_or_else(|| anyhow::anyhow!("completed tournament has no candidate rows"))
 }
 
 fn candidate_corpus_dir(row: &Value, work_dir: &Path) -> Result<PathBuf> {
@@ -238,19 +275,32 @@ fn copy_training_corpus(source: &Path, destination: &Path) -> Result<()> {
     }
     fs::create_dir_all(&tmp).with_context(|| format!("failed to create {}", tmp.display()))?;
     let manifest_path = source.join("manifest.json");
-    let manifest = CorpusManifest::read(&manifest_path)?;
+    let mut manifest = CorpusManifest::read(&manifest_path)?;
     for split in ["train", "val"] {
         let split_manifest = manifest.split(split);
         let source_file = source.join(&split_manifest.file);
         if !source_file.is_file() {
-            continue;
+            bail!(
+                "training corpus manifest references missing {split} file {}",
+                source_file.display()
+            );
         }
-        copy_sample_prefix(
-            &source_file,
-            &tmp.join(&split_manifest.file),
-            Some(split_manifest.samples),
-        )?;
+        let actual_samples = sample::sample_count(&source_file)
+            .with_context(|| format!("failed to validate {}", source_file.display()))?;
+        if actual_samples != split_manifest.samples {
+            bail!(
+                "training corpus manifest claims {split} has {} samples, found {}",
+                split_manifest.samples,
+                actual_samples
+            );
+        }
+        fs::copy(&source_file, tmp.join(&split_manifest.file))
+            .with_context(|| format!("failed to copy {}", source_file.display()))?;
     }
+    manifest.source_corpus_dir = Some(source.display().to_string());
+    manifest.corpus_dir = destination.display().to_string();
+    manifest.canonical_corpus_dir = destination.display().to_string();
+    manifest.write(&tmp.join("manifest.json"))?;
     if destination.exists() {
         if destination.is_dir() {
             fs::remove_dir_all(destination)
@@ -271,19 +321,6 @@ fn copy_training_corpus(source: &Path, destination: &Path) -> Result<()> {
             destination.display()
         )
     })?;
-    Ok(())
-}
-
-fn copy_sample_prefix(source: &Path, destination: &Path, limit: Option<usize>) -> Result<()> {
-    if source.extension().and_then(|value| value.to_str()) != Some(sample::BINARY_SAMPLE_EXTENSION)
-    {
-        bail!(
-            "export expects .{} sample files",
-            sample::BINARY_SAMPLE_EXTENSION
-        );
-    }
-    sample::copy_prefix(source, destination, limit)
-        .with_context(|| format!("failed to copy {}", source.display()))?;
     Ok(())
 }
 

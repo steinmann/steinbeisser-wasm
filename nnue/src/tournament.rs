@@ -51,9 +51,7 @@ pub(super) fn tournament_table_lines(standings: &[TournamentStanding]) -> Vec<St
             qval_text,
         ]);
     }
-    let mut lines = vec!["## Final positive-hit round robin".to_owned()];
-    lines.extend(compact_markdown_table(&headers, &rows));
-    lines
+    compact_markdown_table(&headers, &rows)
 }
 
 fn compact_markdown_table(headers: &[&str], rows: &[Vec<String>]) -> Vec<String> {

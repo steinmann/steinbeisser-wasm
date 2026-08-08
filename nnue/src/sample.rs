@@ -4,6 +4,7 @@ use std::path::Path;
 
 pub const BINARY_SAMPLE_EXTENSION: &str = "sbin";
 const MAGIC: &[u8; 8] = b"SBSMP01\n";
+const RECORD_BYTES: u64 = 70;
 
 #[derive(Clone, Debug)]
 pub struct BinarySample {
@@ -59,13 +60,6 @@ pub fn write_samples(path: &Path, samples: &[BinarySample]) -> io::Result<()> {
     Ok(())
 }
 
-pub fn copy_prefix(source: &Path, destination: &Path, limit: Option<usize>) -> io::Result<usize> {
-    let samples = read_samples(source)?;
-    let count = limit.map_or(samples.len(), |limit| limit.min(samples.len()));
-    write_samples(destination, &samples[..count])?;
-    Ok(count)
-}
-
 pub fn read_samples(path: &Path) -> io::Result<Vec<BinarySample>> {
     let mut reader = BufReader::new(fs::File::open(path)?);
     let mut magic = [0_u8; MAGIC.len()];
@@ -85,6 +79,30 @@ pub fn read_samples(path: &Path) -> io::Result<Vec<BinarySample>> {
         }
     }
     Ok(samples)
+}
+
+pub fn sample_count(path: &Path) -> io::Result<usize> {
+    let mut file = fs::File::open(path)?;
+    let mut magic = [0_u8; MAGIC.len()];
+    file.read_exact(&mut magic)?;
+    if &magic != MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} has an unsupported sample binary header", path.display()),
+        ));
+    }
+    let bytes = file.metadata()?.len();
+    let payload_bytes = bytes
+        .checked_sub(MAGIC.len() as u64)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated sample header"))?;
+    if payload_bytes % RECORD_BYTES != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} has a truncated sample record", path.display()),
+        ));
+    }
+    usize::try_from(payload_bytes / RECORD_BYTES)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "sample count overflows usize"))
 }
 
 pub fn write_header(writer: &mut impl Write) -> io::Result<()> {

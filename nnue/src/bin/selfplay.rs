@@ -311,7 +311,7 @@ fn args() -> Result<Args, String> {
 
 fn usage() -> String {
     "usage:\n\
-       selfplay match --repo . --github-bin <ref-bin> --local-bin <candidate-bin> --openings <fen> --pairs <n> --time <ms>\n\
+       selfplay match --repo . --github-bin <ref-bin> --local-bin <candidate-bin> --openings <fen> --pairs <n> --parallel-games <n> --time <ms>\n\
        selfplay generate --repo . --local-bin <engine-bin> --openings <fen> --games-out <samples.sbin> --target-samples <n> --parallel-games <n> --max-abs-score 3500 --time <ms>\n\
        selfplay build-ref --repo . --github-ref <release-tag> --github-bin <ref-bin>\n"
         .to_owned()
@@ -489,49 +489,151 @@ fn run_match(args: &Args) -> Result<(), String> {
     let mut order = (0..openings.len()).collect::<Vec<_>>();
     shuffle(&mut order, &mut Rng::new(args.seed));
 
-    let mut github = EngineProcess::spawn("github", &built.github)?;
-    let mut local = EngineProcess::spawn("local", &built.local)?;
+    let started = Instant::now();
+    let github_path = Arc::new(built.github.clone());
+    let local_path = Arc::new(built.local.clone());
+    let openings = Arc::new(openings);
+    let order = Arc::new(order);
+    let next_pair = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_count = args.parallel_games.min(args.pairs).max(1);
+    let mut handles = Vec::with_capacity(worker_count);
+
+    for _worker in 0..worker_count {
+        let github_path = Arc::clone(&github_path);
+        let local_path = Arc::clone(&local_path);
+        let openings = Arc::clone(&openings);
+        let order = Arc::clone(&order);
+        let next_pair = Arc::clone(&next_pair);
+        let stop = Arc::clone(&stop);
+        let pairs = args.pairs;
+        let max_abs_score = args.max_abs_score;
+        handles.push(thread::spawn(move || -> Result<_, String> {
+            let result = (|| {
+                let mut results = Vec::new();
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let pair = next_pair.fetch_add(1, Ordering::Relaxed);
+                    if pair >= pairs {
+                        break;
+                    }
+                    let opening = openings[order[pair % order.len()]].clone();
+                    let (first, first_github, first_local) = play_isolated_match_game(
+                        &opening,
+                        EngineId::Github,
+                        EngineId::Local,
+                        &github_path,
+                        &local_path,
+                        limits,
+                        max_abs_score,
+                    )?;
+                    let (second, second_github, second_local) = play_isolated_match_game(
+                        &opening,
+                        EngineId::Local,
+                        EngineId::Github,
+                        &github_path,
+                        &local_path,
+                        limits,
+                        max_abs_score,
+                    )?;
+                    results.push((
+                        pair,
+                        first.record,
+                        second.record,
+                        first_github,
+                        first_local,
+                        second_github,
+                        second_local,
+                    ));
+                }
+                Ok(results)
+            })();
+            if result.is_err() {
+                stop.store(true, Ordering::Relaxed);
+            }
+            result
+        }));
+    }
+
+    let mut paired_records = Vec::with_capacity(args.pairs);
+    let mut worker_error = None;
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(records)) => paired_records.extend(records),
+            Ok(Err(error)) => {
+                if worker_error.is_none() {
+                    worker_error = Some(error);
+                }
+            }
+            Err(_) => {
+                if worker_error.is_none() {
+                    worker_error = Some("match worker panicked".to_owned());
+                }
+            }
+        }
+    }
+    if let Some(error) = worker_error {
+        cleanup(built.temp_root);
+        return Err(error);
+    }
+    paired_records.sort_by_key(|row| row.0);
+
+    let mut github_stats = EngineStats::new();
+    let mut local_stats = EngineStats::new();
     let mut records = Vec::with_capacity(args.pairs * 2);
     let mut pair_points = Vec::with_capacity(args.pairs);
-    let started = Instant::now();
-
-    for pair in 0..args.pairs {
-        let opening = openings[order[pair % order.len()]].clone();
-        let first = play_game(
-            &opening,
-            EngineId::Github,
-            EngineId::Local,
-            &mut github,
-            &mut local,
-            limits,
-            args.max_abs_score,
-        )?;
-        let second = play_game(
-            &opening,
-            EngineId::Local,
-            EngineId::Github,
-            &mut github,
-            &mut local,
-            limits,
-            args.max_abs_score,
-        )?;
-        pair_points.push(first.record.local_points + second.record.local_points);
-        records.push(first.record);
-        records.push(second.record);
+    for (_pair, first, second, first_github, first_local, second_github, second_local) in
+        paired_records
+    {
+        pair_points.push(first.local_points + second.local_points);
+        records.push(first);
+        records.push(second);
+        github_stats.add(&first_github);
+        github_stats.add(&second_github);
+        local_stats.add(&first_local);
+        local_stats.add(&second_local);
     }
 
     let summary = summarize(&records, &pair_points);
     print_summary(
         args,
         &built,
-        &github.stats,
-        &local.stats,
+        &github_stats,
+        &local_stats,
         &summary,
         started.elapsed().as_secs_f64(),
     );
 
     cleanup(built.temp_root);
     Ok(())
+}
+
+fn play_isolated_match_game(
+    opening: &GameState,
+    black_engine: EngineId,
+    white_engine: EngineId,
+    github_path: &Path,
+    local_path: &Path,
+    limits: Limits,
+    max_abs_score: Option<i32>,
+) -> Result<(PlayedGame, EngineStats, EngineStats), String> {
+    // Match heuristics are intentionally scoped to one game.  Reusing either
+    // process would let history/correction state from an earlier opening alter
+    // a later result and make screening depend on schedule order.
+    let mut github = EngineProcess::spawn("github", github_path)?;
+    let mut local = EngineProcess::spawn("local", local_path)?;
+    let game = play_game(
+        opening,
+        black_engine,
+        white_engine,
+        &mut github,
+        &mut local,
+        limits,
+        max_abs_score,
+    )?;
+    Ok((game, github.stats.clone(), local.stats.clone()))
 }
 
 fn summarize(records: &[GameRecord], pair_points: &[f64]) -> Summary {
@@ -584,6 +686,8 @@ fn print_summary(
     println!("openings,{}", args.openings.display());
     println!("pairs,{}", args.pairs);
     println!("games,{}", summary.games);
+    println!("process_lifecycle,fresh_per_game");
+    println!("engine_processes,{}", summary.games.saturating_mul(2));
     println!("time_ms,{}", args.time_ms);
     println!("depth,{}", args.depth);
     println!("elapsed_s,{elapsed_s:.3}");

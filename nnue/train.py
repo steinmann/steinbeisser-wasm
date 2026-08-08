@@ -4,6 +4,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 import os
@@ -98,7 +99,10 @@ class RunState:
     source_bin: str | None = None
     train_samples: int = 0
     reference_ref: str = ""
+    run_signature: dict[str, object] | None = None
     screened_candidates: list[dict[str, object]] = field(default_factory=list)
+    ranking_completed: bool = False
+    ranked_candidates: list[dict[str, object]] = field(default_factory=list)
     tournament_completed: bool = False
     tournament_summary: dict[str, object] | None = None
     tournament_results: object = None
@@ -145,9 +149,30 @@ class RunState:
             source_bin=str(raw["source_bin"]) if raw.get("source_bin") is not None else None,
             train_samples=int(raw.get("train_samples", 0)),
             reference_ref=reference_ref,
+            run_signature=(
+                {
+                    str(key): value
+                    for key, value in raw.get("run_signature", {}).items()
+                }
+                if isinstance(raw.get("run_signature"), dict)
+                else None
+            ),
             screened_candidates=[
                 candidate for candidate in screened if isinstance(candidate, dict)
             ] if isinstance(screened, list) else [],
+            ranking_completed=bool(
+                raw.get("ranking_completed", raw.get("qualification_completed"))
+            ),
+            ranked_candidates=[
+                candidate
+                for candidate in raw.get(
+                    "ranked_candidates", raw.get("qualified_candidates", [])
+                )
+                if isinstance(candidate, dict)
+            ] if isinstance(
+                raw.get("ranked_candidates", raw.get("qualified_candidates", [])),
+                list,
+            ) else [],
             tournament_completed=bool(raw.get("tournament_completed")),
             tournament_summary=summary if isinstance(summary, dict) else None,
             tournament_results=raw.get("tournament_results"),
@@ -170,7 +195,10 @@ class RunState:
             "source_bin": self.source_bin,
             "train_samples": self.train_samples,
             "reference_ref": self.reference_ref,
+            "run_signature": self.run_signature,
             "screened_candidates": self.screened_candidates,
+            "ranking_completed": self.ranking_completed,
+            "ranked_candidates": self.ranked_candidates,
             "tournament_completed": self.tournament_completed,
             "tournament_summary": self.tournament_summary,
             "tournament_results": self.tournament_results,
@@ -186,12 +214,28 @@ class RunState:
         write_json(STATE_PATH, self.to_dict())
 
     def record_cycle(self, result: "CycleResult") -> None:
+        signature = current_run_signature()
+        if self.run_signature is not None and self.run_signature != signature:
+            changed = sorted(
+                key
+                for key in set(self.run_signature) | set(signature)
+                if self.run_signature.get(key) != signature.get(key)
+            )
+            raise SystemExit(
+                "training configuration changed while the run was active "
+                f"({', '.join(changed)}); restart with --clean"
+            )
         self.cycle = result.cycle
         self.model = str(result.model)
         self.source_bin = str(result.source_bin)
         self.train_samples = result.train_samples
         self.reference_ref = REFERENCE_REF
-        self.screened_candidates.extend(result.positive_records)
+        self.run_signature = signature
+        combined_candidates = self.screened_candidates + result.screened_records
+        validate_model_binary_mapping(combined_candidates, "screening")
+        self.screened_candidates = combined_candidates
+        self.ranking_completed = False
+        self.ranked_candidates = []
         self.tournament_completed = False
         self.tournament_summary = None
         self.tournament_results = None
@@ -263,6 +307,8 @@ class ContinuousGenerator:
         command_text: CommandFormatter,
     ) -> None:
         self.stop_event = threading.Event()
+        self.pause_event = threading.Event()
+        self.paused_event = threading.Event()
         self.lock = threading.Lock()
         self.thread: threading.Thread | None = None
         self.proc: subprocess.Popen[str] | None = None
@@ -317,15 +363,43 @@ class ContinuousGenerator:
         if self.thread is not None:
             self.thread.join(timeout=10)
 
+    def pause(self) -> None:
+        if self.thread is None:
+            return
+        self.pause_event.set()
+        while not self.paused_event.wait(timeout=1.0):
+            self.check()
+            if self.thread is not None and not self.thread.is_alive():
+                raise SystemExit("selfplay generator stopped before reaching pause")
+
+    def resume(self) -> None:
+        self.pause_event.clear()
+        self.paused_event.clear()
+
+    def wait_while_paused(self) -> bool:
+        if not self.pause_event.is_set():
+            return True
+        self.paused_event.set()
+        while self.pause_event.is_set() and not self.stop_event.is_set():
+            time.sleep(0.1)
+        self.paused_event.clear()
+        return not self.stop_event.is_set()
+
     def run(self) -> None:
         while not self.stop_event.is_set():
+            if not self.wait_while_paused():
+                return
             if not self.wait_for_backlog_slot():
                 return
+            if self.pause_event.is_set():
+                continue
             if not self.run_one_shard():
                 return
 
     def wait_for_backlog_slot(self) -> bool:
         while not self.stop_event.is_set():
+            if self.pause_event.is_set():
+                return True
             with self.lock:
                 target = self.target_unique_samples
                 estimated_unique_samples = self.last_unique_samples + self.generated_since_snapshot
@@ -478,7 +552,7 @@ def tournament_table_lines(standings: list[dict[str, object]]) -> list[str]:
                 qval_text,
             ]
         )
-    return ["## Final positive-hit round robin"] + compact_markdown_table(headers, rows)
+    return compact_markdown_table(headers, rows)
 
 
 def markdown_table_cell(value: object) -> str:
@@ -949,7 +1023,15 @@ def prepare_match_openings(config: OpeningBookConfig) -> None:
         if not config.match_openings.is_file():
             raise SystemExit(f"missing match openings override: {config.match_openings}")
         return
-    openings = load_single_position_openings(config) + load_random_book_openings(config)
+    # Screening is intentionally one-dimensional during the training run:
+    # exactly one unique random opening per color-swapped pair.  Belgian Daisy
+    # is evaluated separately after training, so a weakness there cannot be
+    # hidden inside an aggregate opening score.
+    openings = load_unique_book_openings(
+        config.random_openings,
+        MATCH_GAMES // 2,
+        "random screening",
+    )
     config.match_openings.parent.mkdir(parents=True, exist_ok=True)
     config.match_openings.write_text("\n".join(openings) + "\n", encoding="utf-8")
 
@@ -993,6 +1075,7 @@ def prepare_tournament_openings(
         config.random_openings,
         required,
         "tournament",
+        skip=MATCH_GAMES // 2,
     )
     write_opening_file(config.tournament_openings, openings)
     return config.tournament_openings, openings
@@ -1032,7 +1115,13 @@ def load_book_openings(path: Path, count: int, label: str) -> list[str]:
     return openings[:count]
 
 
-def load_unique_book_openings(path: Path, count: int, label: str) -> list[str]:
+def load_unique_book_openings(
+    path: Path,
+    count: int,
+    label: str,
+    *,
+    skip: int = 0,
+) -> list[str]:
     if not path.is_file():
         raise SystemExit(f"missing {label} opening book: {path}")
     openings: list[str] = []
@@ -1042,6 +1131,8 @@ def load_unique_book_openings(path: Path, count: int, label: str) -> list[str]:
         if opening in seen:
             continue
         seen.add(opening)
+        if len(seen) <= skip:
+            continue
         openings.append(opening)
         if len(openings) == count:
             return openings
@@ -1089,18 +1180,25 @@ MATCH_OPENINGS_OVERRIDE = os.environ.get("STEINBEISSER_TRAIN_MATCH_OPENINGS")
 MATCH_OPENINGS = (
     Path(MATCH_OPENINGS_OVERRIDE)
     if MATCH_OPENINGS_OVERRIDE
-    else WORK_DIR / "screening_openings_120.fen"
+    else WORK_DIR / "screening_random_500.fen"
 )
 MATCH_SINGLE_OPENINGS_DIR = Path(
     os.environ.get("STEINBEISSER_TRAIN_MATCH_SINGLE_OPENINGS_DIR", REPO / "data/positions")
 )
 MATCH_RANDOM_OPENINGS = Path(os.environ.get("STEINBEISSER_TRAIN_MATCH_RANDOM_OPENINGS", OPENINGS))
+BELGIAN_OPENINGS = Path(
+    os.environ.get(
+        "STEINBEISSER_TRAIN_BELGIAN_OPENINGS",
+        REPO / "data/positions/belgian-daisy.fen",
+    )
+)
 NNUE_MANIFEST = NNUE_DIR / "Cargo.toml"
 SELFPLAY_SOURCE = NNUE_DIR / "src/bin/selfplay.rs"
 EXE_SUFFIX = ".exe" if os.name == "nt" else ""
 SELFPLAY_BIN = CARGO_TARGET_DIR / "release" / f"nnue-selfplay{EXE_SUFFIX}"
 NNUE_BIN = CARGO_TARGET_DIR / "release" / f"nnue{EXE_SUFFIX}"
 REFERENCE_REF = ""
+REFERENCE_COMMIT = ""
 REFERENCE_BIN = Path()
 
 
@@ -1114,6 +1212,14 @@ def env_float(name: str, default: float) -> float:
 
 def slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 VALIDATION_SAMPLES = env_int("STEINBEISSER_TRAIN_VALIDATION_SAMPLES", 10_000)
@@ -1138,15 +1244,21 @@ MAX_ABS_SCORE = env_int("STEINBEISSER_TRAIN_MAX_ABS_SCORE", 3500)
 MATCH_MS = env_int("STEINBEISSER_TRAIN_MATCH_MS", 5)
 MATCH_SINGLE_POSITION_COUNT = env_int("STEINBEISSER_TRAIN_MATCH_SINGLE_POSITIONS", 60)
 MATCH_RANDOM_POSITION_COUNT = env_int("STEINBEISSER_TRAIN_MATCH_RANDOM_POSITIONS", 60)
-MATCH_GAMES = env_int(
-    "STEINBEISSER_TRAIN_MATCH_GAMES",
-    2 * (MATCH_SINGLE_POSITION_COUNT + MATCH_RANDOM_POSITION_COUNT),
+MATCH_GAMES = env_int("STEINBEISSER_TRAIN_MATCH_GAMES", 1_000)
+BELGIAN_RANKING_GAMES = env_int(
+    "STEINBEISSER_TRAIN_BELGIAN_RANKING_GAMES",
+    env_int("STEINBEISSER_TRAIN_QUALIFIER_GAMES", 1_000),
 )
 SCREEN_CHECKPOINTS = env_int("STEINBEISSER_TRAIN_SCREEN_CHECKPOINTS", 3)
 TARGET_TRAIN_SAMPLES = env_int("STEINBEISSER_TRAIN_TARGET_SAMPLES", 15_000_000)
 TOURNAMENT_GAMES_PER_ENGINE = env_int(
     "STEINBEISSER_TRAIN_TOURNAMENT_GAMES_PER_ENGINE",
-    10_000,
+    16_000,
+)
+TOURNAMENT_CANDIDATES = env_int("STEINBEISSER_TRAIN_TOURNAMENT_CANDIDATES", 8)
+TOURNAMENT_CONDITION_GAMES = env_int(
+    "STEINBEISSER_TRAIN_TOURNAMENT_CONDITION_GAMES",
+    1_000,
 )
 TOURNAMENT_GAMES_PER_PAIRING_OVERRIDE = env_int(
     "STEINBEISSER_TRAIN_TOURNAMENT_GAMES_PER_PAIRING",
@@ -1180,6 +1292,7 @@ SNAPSHOT_POLL_SECONDS = env_float("STEINBEISSER_TRAIN_POLL_SECONDS", 10.0)
 PROGRESS_INTERVAL_SECONDS = env_float("STEINBEISSER_TRAIN_PROGRESS_SECONDS", 60.0)
 STATUS_OUTPUT = env_int("STEINBEISSER_TRAIN_STATUS_OUTPUT", 0) > 0
 TRAIN_EPOCH_COUNT = env_int("STEINBEISSER_TRAIN_EPOCHS", 100)
+TRAIN_PATIENCE = env_int("STEINBEISSER_TRAIN_PATIENCE", 20)
 TRAIN_CONFIG = TrainConfig(
     validation_samples=VALIDATION_SAMPLES,
     min_train_increment=MIN_TRAIN_INCREMENT,
@@ -1210,6 +1323,54 @@ GENERATOR_CONFIG = GeneratorConfig(
 EMIT_LOCK = threading.Lock()
 LOG_LOCK = threading.Lock()
 
+
+def current_run_signature() -> dict[str, object]:
+    screening_source = (
+        MATCH_OPENINGS if MATCH_OPENINGS_OVERRIDE else MATCH_RANDOM_OPENINGS
+    )
+    tournament_source = (
+        TOURNAMENT_OPENINGS
+        if OPENING_CONFIG.tournament_openings_explicit
+        else MATCH_RANDOM_OPENINGS
+    )
+    return {
+        "model_features": MODEL_FEATURES,
+        "model_input_count": MODEL_INPUT_COUNT,
+        "model_max_active_features": MODEL_MAX_ACTIVE_FEATURES,
+        "model_architecture": MODEL_ARCHITECTURE,
+        "reference_commit": REFERENCE_COMMIT,
+        "validation_samples": VALIDATION_SAMPLES,
+        "initial_train_samples": INITIAL_TRAIN_SAMPLES,
+        "min_train_increment": MIN_TRAIN_INCREMENT,
+        "max_train_increment": MAX_TRAIN_INCREMENT,
+        "max_cycles": MAX_CYCLES,
+        "target_train_samples": TARGET_TRAIN_SAMPLES,
+        "train_epochs": TRAIN_EPOCH_COUNT,
+        "train_patience": TRAIN_PATIENCE,
+        "screen_checkpoints": SCREEN_CHECKPOINTS,
+        "screen_games": MATCH_GAMES,
+        "ranking_games": BELGIAN_RANKING_GAMES,
+        "match_ms": MATCH_MS,
+        "tournament_candidates": TOURNAMENT_CANDIDATES,
+        "tournament_condition_games": TOURNAMENT_CONDITION_GAMES,
+        "tournament_games_per_engine": TOURNAMENT_GAMES_PER_ENGINE,
+        "generation_workers": GENERATION_WORKERS,
+        "core_budget": CORE_BUDGET,
+        "tournament_parallel_matches": TOURNAMENT_PARALLEL_MATCHES,
+        "nnue_train_threads": NNUE_TRAIN_THREADS,
+        "nnue_loader_workers": NNUE_LOADER_WORKERS,
+        "selfplay_ms": SELFPLAY_MS,
+        "max_abs_score": MAX_ABS_SCORE,
+        "selfplay_openings": str(OPENINGS),
+        "selfplay_openings_sha256": file_sha256(OPENINGS),
+        "screening_opening_source": str(screening_source),
+        "screening_opening_source_sha256": file_sha256(screening_source),
+        "belgian_openings": str(BELGIAN_OPENINGS),
+        "belgian_openings_sha256": file_sha256(BELGIAN_OPENINGS),
+        "tournament_opening_source": str(tournament_source),
+        "tournament_opening_source_sha256": file_sha256(tournament_source),
+    }
+
 SCRATCH_DIRS = (
     BIN_DIR,
     SHARD_DIR,
@@ -1227,8 +1388,10 @@ RUN_DIRS = SCRATCH_DIRS + RUN_OUTPUT_DIRS + FINAL_OUTPUT_DIRS
 def usage() -> str:
     return (
         "usage: train [--clean]\n"
-        "   or: python3 nnue/train.py [--clean]\n\n"
+        "   or: python3 nnue/train.py [--clean]\n"
+        "   or: python3 nnue/train.py --smoke-test\n\n"
         "  --clean   delete the configured /tmp run directory before starting\n\n"
+        "  --smoke-test   print and validate the screening/tournament report shape without games\n\n"
         "nnue/train.py always uses the latest GitHub release as the fixed reference."
     )
 
@@ -1755,8 +1918,20 @@ def resolve_reference_ref() -> str:
 
 
 def configure_release_ref() -> None:
-    global REFERENCE_REF, REFERENCE_BIN
+    global REFERENCE_REF, REFERENCE_COMMIT, REFERENCE_BIN
     REFERENCE_REF = resolve_reference_ref()
+    resolved = subprocess.run(
+        ["git", "-C", REPO, "rev-parse", f"{REFERENCE_REF}^{{commit}}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if resolved.returncode != 0:
+        raise SystemExit(
+            f"failed to resolve release tag {REFERENCE_REF}: {resolved.stderr.strip()}"
+        )
+    REFERENCE_COMMIT = resolved.stdout.strip()
     REFERENCE_BIN = BIN_DIR / f"steinbeisser_{slug(REFERENCE_REF)}{EXE_SUFFIX}"
     configure_training_dirs()
 
@@ -1877,6 +2052,7 @@ def single_core_env() -> dict[str, str]:
             "STEINBEISSER_NNUE_FEATURE_SET": MODEL_FEATURES,
             "STEINBEISSER_NNUE_ARCHITECTURE": MODEL_ARCHITECTURE,
             "STEINBEISSER_NNUE_EPOCHS": str(TRAIN_EPOCH_COUNT),
+            "STEINBEISSER_NNUE_PATIENCE": str(TRAIN_PATIENCE),
             "CARGO_TARGET_DIR": str(CARGO_TARGET_DIR),
             "OMP_NUM_THREADS": str(NNUE_TRAIN_THREADS),
             "OPENBLAS_NUM_THREADS": str(NNUE_TRAIN_THREADS),
@@ -1924,11 +2100,15 @@ def setup() -> None:
         f"selfplay_ms={SELFPLAY_MS} "
         f"screen_ms={MATCH_MS} "
         f"screen_games={MATCH_GAMES} "
+        f"belgian_ranking_games={BELGIAN_RANKING_GAMES} "
+        f"tournament_candidates={TOURNAMENT_CANDIDATES} "
+        f"tournament_condition_games={TOURNAMENT_CONDITION_GAMES} "
         f"parallel_games={GENERATION_WORKERS} "
         f"tournament_parallel_matches={TOURNAMENT_PARALLEL_MATCHES} "
         f"tournament_target_games_per_engine={TOURNAMENT_GAMES_PER_ENGINE} "
         f"loader_workers={NNUE_LOADER_WORKERS} "
         f"train_threads={NNUE_TRAIN_THREADS} "
+        f"patience={TRAIN_PATIENCE} "
         f"min_train_increment={MIN_TRAIN_INCREMENT} "
         f"generation_backlog_samples={GENERATION_BACKLOG_SAMPLES} "
         f"target_train_positions={TARGET_TRAIN_SAMPLES} "
@@ -1940,8 +2120,36 @@ def setup() -> None:
     )
     if MATCH_GAMES <= 0 or MATCH_GAMES % 2 != 0:
         raise SystemExit("STEINBEISSER_TRAIN_MATCH_GAMES must be a positive even number")
+    if BELGIAN_RANKING_GAMES <= 0 or BELGIAN_RANKING_GAMES % 2 != 0:
+        raise SystemExit(
+            "STEINBEISSER_TRAIN_BELGIAN_RANKING_GAMES must be a positive even number"
+        )
+    if TOURNAMENT_CONDITION_GAMES <= 0 or TOURNAMENT_CONDITION_GAMES % 2 != 0:
+        raise SystemExit(
+            "STEINBEISSER_TRAIN_TOURNAMENT_CONDITION_GAMES must be a positive even number"
+        )
+    if TOURNAMENT_CANDIDATES <= 0:
+        raise SystemExit("STEINBEISSER_TRAIN_TOURNAMENT_CANDIDATES must be positive")
+    expected_tournament_games = (
+        TOURNAMENT_CANDIDATES * 2 * TOURNAMENT_CONDITION_GAMES
+    )
+    if TOURNAMENT_GAMES_PER_ENGINE != expected_tournament_games:
+        raise SystemExit(
+            "STEINBEISSER_TRAIN_TOURNAMENT_GAMES_PER_ENGINE must equal "
+            f"{expected_tournament_games} for {TOURNAMENT_CANDIDATES} candidates "
+            f"and {TOURNAMENT_CONDITION_GAMES} games per condition"
+        )
     if TOURNAMENT_PARALLEL_MATCHES <= 0:
         raise SystemExit("STEINBEISSER_TRAIN_TOURNAMENT_PARALLEL_MATCHES must be positive")
+    if GENERATION_WORKERS <= 0 or CORE_BUDGET <= 0:
+        raise SystemExit(
+            "STEINBEISSER_TRAIN_PARALLEL_GAMES and STEINBEISSER_TRAIN_CORES "
+            "must be positive"
+        )
+    if NNUE_LOADER_WORKERS <= 0 or NNUE_TRAIN_THREADS <= 0:
+        raise SystemExit("NNUE loader workers and training threads must be positive")
+    if TRAIN_EPOCH_COUNT <= 0 or TRAIN_PATIENCE <= 0:
+        raise SystemExit("NNUE epochs and patience must be positive")
     TRAIN_CONFIG.validate()
     if GENERATION_BACKLOG_SAMPLES < 0:
         raise SystemExit("STEINBEISSER_TRAIN_GENERATION_BACKLOG_SAMPLES must be non-negative")
@@ -1955,17 +2163,29 @@ def setup() -> None:
         raise SystemExit(
             "STEINBEISSER_TRAIN_TOURNAMENT_GAMES_PER_PAIRING must be non-negative"
         )
+    if TOURNAMENT_GAMES_PER_PAIRING_OVERRIDE:
+        raise SystemExit(
+            "STEINBEISSER_TRAIN_TOURNAMENT_GAMES_PER_PAIRING is incompatible with "
+            "the fixed Random + Belgian tournament; configure "
+            "STEINBEISSER_TRAIN_TOURNAMENT_CONDITION_GAMES instead"
+        )
     if MAX_ABS_SCORE < 0:
         raise SystemExit("STEINBEISSER_TRAIN_MAX_ABS_SCORE must be non-negative")
     os.environ["STEINBEISSER_TRAIN_ARTIFACT_ROOT"] = str(TRAINER_ARTIFACT_ROOT)
     os.environ["CARGO_TARGET_DIR"] = str(CARGO_TARGET_DIR)
     for path in RUN_DIRS:
         path.mkdir(parents=True, exist_ok=True)
-    for required in [OPENINGS, NNUE_MANIFEST]:
+    for required in [OPENINGS, BELGIAN_OPENINGS, NNUE_MANIFEST]:
         if not required.exists():
             raise SystemExit(f"missing required path: {required}")
     emit_status("setup=openings")
     prepare_match_openings(OPENING_CONFIG)
+    prepare_tournament_openings(
+        OPENING_CONFIG,
+        TOURNAMENT_CONDITION_GAMES // 2,
+    )
+    if not read_fen_lines(BELGIAN_OPENINGS):
+        raise SystemExit(f"Belgian ranking opening file is empty: {BELGIAN_OPENINGS}")
     emit_status("setup=build_rust_tools")
     run(
         [
@@ -2123,7 +2343,7 @@ class CycleResult:
     selected_models: list[Path]
     selected_bins: list[Path]
     release_matches: list[MatchResult]
-    positive_records: list[dict[str, object]]
+    screened_records: list[dict[str, object]]
     reused_training: bool
     corpus_seconds: float | None
     training_seconds: float | None
@@ -2287,7 +2507,7 @@ def build_reference_net_engine(cycle: int, model: Path, rank: int = 1) -> Path:
             "--target",
             target,
             "--target-dir",
-            CANDIDATE_TARGET_DIR / candidate_id,
+            CANDIDATE_TARGET_DIR,
             "--candidate-id",
             candidate_id,
         ],
@@ -2315,6 +2535,7 @@ def run_selfplay_match(
     label: str | None = None,
     allow_local_failure: bool = True,
     allow_baseline_failure: bool = False,
+    parallel_games: int = CORE_BUDGET,
 ) -> MatchResult:
     if label is not None:
         emit_status(
@@ -2341,6 +2562,8 @@ def run_selfplay_match(
         str(games),
         "--time-ms",
         str(time_ms),
+        "--parallel-games",
+        str(parallel_games),
         "--seed",
         str(time.time_ns() & ((1 << 63) - 1)),
         "--github-ref",
@@ -2361,6 +2584,23 @@ def run_selfplay_match(
         elo_lower=float(payload["elo_lower"]),
         elo_upper=float(payload["elo_upper"]),
     )
+    result_games = result.wins + result.draws + result.losses
+    if result_games != games:
+        raise SystemExit(
+            f"rust screen-match returned {result_games} games; expected {games}"
+        )
+    if min(result.wins, result.draws, result.losses) < 0:
+        raise SystemExit("rust screen-match returned a negative WDL count")
+    if not all(math.isfinite(value) for value in (result.elo, result.elo_lower, result.elo_upper)):
+        raise SystemExit("rust screen-match returned non-finite Elo data")
+    if result.elo_lower > result.elo_upper:
+        raise SystemExit("rust screen-match returned an inverted Elo confidence interval")
+    expected_elo = elo_from_points(result.wins + 0.5 * result.draws, games)
+    if abs(result.elo - expected_elo) > 0.25:
+        raise SystemExit(
+            "rust screen-match returned Elo inconsistent with its WDL "
+            f"({result.elo:+.2f} vs {expected_elo:+.2f})"
+        )
     if label is not None:
         match_status = "match=forfeit " if payload.get("forfeit") else "match=done "
         emit_status(
@@ -2373,7 +2613,26 @@ def run_selfplay_match(
 
 
 def load_state() -> RunState:
-    return RunState.load()
+    state = RunState.load()
+    if state.cycle <= 0:
+        return state
+    expected = current_run_signature()
+    if state.run_signature is None:
+        raise SystemExit(
+            "existing training state predates run-configuration validation; "
+            "restart with --clean"
+        )
+    if state.run_signature != expected:
+        changed = sorted(
+            key
+            for key in set(state.run_signature) | set(expected)
+            if state.run_signature.get(key) != expected.get(key)
+        )
+        raise SystemExit(
+            "training configuration changed within this run "
+            f"({', '.join(changed)}); restart with --clean"
+        )
+    return state
 
 
 def write_state(state: RunState | dict[str, object]) -> None:
@@ -2404,7 +2663,7 @@ def positive_net_path(cycle: int, rank: int, epoch: int) -> Path:
     return POSITIVE_NET_DIR / f"{cycle_candidate_id(cycle, rank)}_epoch{epoch:04}.nnq"
 
 
-def public_positive_net_record(record: dict[str, object]) -> dict[str, object]:
+def public_ranked_net_record(record: dict[str, object]) -> dict[str, object]:
     return {
         "id": record.get("id"),
         "cycle": record.get("cycle"),
@@ -2412,18 +2671,24 @@ def public_positive_net_record(record: dict[str, object]) -> dict[str, object]:
         "epoch": record.get("epoch"),
         "qval_loss": record.get("qval_loss"),
         "model": record.get("model"),
+        "model_sha256": record.get("model_sha256"),
+        "source_bin_sha256": record.get("source_bin_sha256"),
         "train_prefix_samples": record.get("train_samples"),
         "reference_ref": record.get("reference_ref"),
         "elo_vs_release": record.get("elo_vs_release"),
         "elo_95_ci": record.get("elo_95_ci"),
         "wdl_vs_release": record.get("wdl_vs_release"),
+        "belgian_elo_vs_release": record.get("belgian_elo_vs_release"),
+        "belgian_elo_95_ci": record.get("belgian_elo_95_ci"),
+        "belgian_wdl_vs_release": record.get("belgian_wdl_vs_release"),
+        "belgian_rank": record.get("belgian_rank"),
     }
 
 
-def write_positive_net_manifest(records: list[dict[str, object]]) -> None:
-    exported_records = [public_positive_net_record(record) for record in records]
+def write_ranked_net_manifest(records: list[dict[str, object]]) -> None:
+    exported_records = [public_ranked_net_record(record) for record in records]
     write_json(
-        POSITIVE_NET_DIR / "positive_nets.json",
+        POSITIVE_NET_DIR / "ranked_nets.json",
         {
             "reference_ref": REFERENCE_REF,
             "count": len(exported_records),
@@ -2448,12 +2713,14 @@ def screen_candidate_records(
         zip(rows, selected_models, selected_bins, release_matches),
         start=1,
     ):
-        if match.elo <= 0.0:
-            continue
         epoch = int(row["epoch"])
-        kept_model = positive_net_path(cycle, rank, epoch)
-        kept_model.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(model, kept_model)
+        is_random_positive = match.elo > 0.0
+        if is_random_positive:
+            kept_model = positive_net_path(cycle, rank, epoch)
+            kept_model.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(model, kept_model)
+        else:
+            kept_model = model
         records.append(
             {
                 "id": cycle_candidate_id(cycle, rank),
@@ -2462,45 +2729,312 @@ def screen_candidate_records(
                 "epoch": epoch,
                 "qval_loss": float(row["quantized_val_loss"]),
                 "model": str(kept_model),
+                "model_sha256": file_sha256(kept_model),
                 "source_bin": str(source_bin),
+                "source_bin_sha256": file_sha256(source_bin),
                 "corpus_dir": str(corpus_dir),
                 "train_samples": train_samples,
                 "reference_ref": REFERENCE_REF,
                 "elo_vs_release": match.elo,
                 "elo_95_ci": [match.elo_lower, match.elo_upper],
                 "wdl_vs_release": [match.wins, match.draws, match.losses],
+                "random_elo_vs_release": match.elo,
+                "random_elo_95_ci": [match.elo_lower, match.elo_upper],
+                "random_wdl_vs_release": [match.wins, match.draws, match.losses],
+                "random_screen_positive": is_random_positive,
+                "random_screen_games": MATCH_GAMES,
+                "random_screen_time_ms": MATCH_MS,
+                "random_screen_openings": str(MATCH_OPENINGS),
+                "random_screen_openings_sha256": file_sha256(MATCH_OPENINGS),
             }
         )
     return records
 
 
+def rank_screened_candidates(state: RunState) -> None:
+    candidates = [
+        candidate
+        for candidate in state.screened_candidates
+        if isinstance(candidate, dict)
+        and str(candidate.get("reference_ref") or "") == REFERENCE_REF
+    ]
+    if len(candidates) < TOURNAMENT_CANDIDATES:
+        raise SystemExit(
+            f"Belgian ranking needs at least {TOURNAMENT_CANDIDATES} screened "
+            f"candidates; found {len(candidates)}"
+        )
+    candidate_ids = [str(candidate.get("id") or "") for candidate in candidates]
+    if any(not candidate_id for candidate_id in candidate_ids):
+        raise SystemExit("screened candidate is missing its stable id")
+    if len(set(candidate_ids)) != len(candidate_ids):
+        raise SystemExit("screened candidate ids are not unique")
+    random_openings_sha256 = file_sha256(MATCH_OPENINGS)
+    for candidate in candidates:
+        if (
+            int(candidate.get("random_screen_games", 0)) != MATCH_GAMES
+            or int(candidate.get("random_screen_time_ms", -1)) != MATCH_MS
+            or str(candidate.get("random_screen_openings") or "") != str(MATCH_OPENINGS)
+            or str(candidate.get("random_screen_openings_sha256") or "")
+            != random_openings_sha256
+        ):
+            raise SystemExit(
+                "Random screening configuration changed within this run; "
+                "restart with --clean rather than mixing candidate results"
+            )
+    candidate_id_set = set(candidate_ids)
+    belgian_openings_sha256 = file_sha256(BELGIAN_OPENINGS)
+    cached_results = {
+        str(candidate.get("id") or ""): candidate
+        for candidate in state.ranked_candidates
+        if isinstance(candidate, dict)
+        and str(candidate.get("reference_ref") or "") == REFERENCE_REF
+        and int(candidate.get("belgian_games", 0)) == BELGIAN_RANKING_GAMES
+        and int(candidate.get("belgian_time_ms", -1)) == MATCH_MS
+        and str(candidate.get("belgian_openings") or "") == str(BELGIAN_OPENINGS)
+        and str(candidate.get("belgian_openings_sha256") or "")
+        == belgian_openings_sha256
+        and score_from_wdl(candidate.get("belgian_wdl_vs_release")) != float("-inf")
+        and sum(int(value) for value in candidate.get("belgian_wdl_vs_release", []))
+        == BELGIAN_RANKING_GAMES
+    }
+    results: list[dict[str, object]] = [
+        dict(candidate)
+        for candidate_id, candidate in cached_results.items()
+        if candidate_id in candidate_id_set
+    ]
+    if state.ranking_completed and {
+        str(candidate.get("id") or "") for candidate in results
+    } == candidate_id_set:
+        results.sort(
+            key=lambda candidate: (
+                -belgian_ranking_score(candidate),
+                -candidate_random_screen_score(candidate),
+                float(candidate.get("qval_loss", math.inf)),
+                int(candidate.get("cycle", 0)),
+                int(candidate.get("rank", 0)),
+            )
+        )
+        for rank, record in enumerate(results, start=1):
+            record["belgian_rank"] = rank
+        state.ranked_candidates = results
+        return
+    if not REFERENCE_BIN.is_file():
+        raise SystemExit(f"latest release binary missing for Belgian ranking: {REFERENCE_BIN}")
+    for candidate in candidates:
+        validate_candidate_artifacts(candidate, "Belgian ranking")
+    completed_ids = {str(candidate.get("id") or "") for candidate in results}
+    emit_status(
+        "belgian_ranking=start "
+        f"candidates={len(candidates)} "
+        f"opening=belgian-daisy games={BELGIAN_RANKING_GAMES} time_ms={MATCH_MS}"
+    )
+    for index, candidate in enumerate(candidates, start=1):
+        candidate_id = str(candidate.get("id") or f"candidate-{index}")
+        if candidate_id in completed_ids:
+            continue
+        source_bin = Path(str(candidate.get("source_bin") or ""))
+        match = run_selfplay_match(
+            source_bin,
+            REFERENCE_BIN,
+            BELGIAN_OPENINGS,
+            BELGIAN_RANKING_GAMES,
+            MATCH_MS,
+            label=f"belgian_rank={index}/{len(candidates)} candidate={candidate_id}",
+            parallel_games=CORE_BUDGET,
+        )
+        record = dict(candidate)
+        record.update(
+            {
+                "belgian_elo_vs_release": match.elo,
+                "belgian_elo_95_ci": [match.elo_lower, match.elo_upper],
+                "belgian_wdl_vs_release": [match.wins, match.draws, match.losses],
+                "belgian_games": BELGIAN_RANKING_GAMES,
+                "belgian_time_ms": MATCH_MS,
+                "belgian_openings": str(BELGIAN_OPENINGS),
+                "belgian_openings_sha256": belgian_openings_sha256,
+            }
+        )
+        results.append(record)
+        completed_ids.add(candidate_id)
+        # Qualification can take many hours. Persist each completed match so a
+        # restart never replays every candidate that already finished.
+        state.ranked_candidates = results
+        state.ranking_completed = False
+        state.save()
+    results.sort(
+        key=lambda candidate: (
+            -belgian_ranking_score(candidate),
+            -candidate_random_screen_score(candidate),
+            float(candidate.get("qval_loss", math.inf)),
+            int(candidate.get("cycle", 0)),
+            int(candidate.get("rank", 0)),
+        )
+    )
+    for rank, record in enumerate(results, start=1):
+        record["belgian_rank"] = rank
+        wins, draws, losses = (
+            int(value) for value in record.get("belgian_wdl_vs_release", [0, 0, 0])
+        )
+        lower, upper = (
+            float(value) for value in record.get("belgian_elo_95_ci", [0.0, 0.0])
+        )
+        emit(
+            f"belgian_rank={rank}/{len(results)} player={candidate_player_name(record)} "
+            f"wdl_vs_{slug(REFERENCE_REF)}={wins}-{draws}-{losses} "
+            f"elo_vs_{slug(REFERENCE_REF)}="
+            f"{float(record.get('belgian_elo_vs_release', 0.0)):+.2f}"
+            f"[{lower:+.2f},{upper:+.2f}]"
+        )
+    state.ranked_candidates = results
+    state.ranking_completed = True
+    state.save()
+    write_ranked_net_manifest(results)
+    emit_raw("")
+
+
 def select_tournament_candidates(
     candidates: list[dict[str, object]],
 ) -> list[dict[str, object]]:
-    seen_bins: set[str] = set()
-    positives: list[dict[str, object]] = []
-    for candidate in candidates:
-        if str(candidate.get("reference_ref") or "") != REFERENCE_REF:
-            continue
-        if float(candidate.get("elo_vs_release", float("-inf"))) <= 0.0:
-            continue
-        source_bin = str(candidate.get("source_bin") or "")
-        if not source_bin or source_bin in seen_bins:
-            continue
-        if not Path(source_bin).is_file():
-            append_log(f"# skipping tournament candidate with missing binary: {source_bin}")
-            continue
-        positives.append(candidate)
-        seen_bins.add(source_bin)
-    return sorted(
-        positives,
+    ranked = sorted(
+        [
+            candidate
+            for candidate in candidates
+            if str(candidate.get("reference_ref") or "") == REFERENCE_REF
+        ],
         key=lambda candidate: (
-            -float(candidate.get("elo_vs_release", float("-inf"))),
+            int(candidate.get("belgian_rank", 1 << 30)),
+            -belgian_ranking_score(candidate),
+            -candidate_random_screen_score(candidate),
             float(candidate.get("qval_loss", float("inf"))),
             int(candidate.get("cycle", 0)),
             int(candidate.get("rank", 0)),
         ),
     )
+    selected: list[dict[str, object]] = []
+    selected_model_hashes: set[str] = set()
+    for candidate in ranked:
+        model_hash = str(candidate.get("model_sha256") or "")
+        if not model_hash:
+            raise SystemExit("ranked candidate is missing its model hash")
+        if model_hash in selected_model_hashes:
+            continue
+        selected.append(candidate)
+        selected_model_hashes.add(model_hash)
+        if len(selected) == TOURNAMENT_CANDIDATES:
+            break
+    if len(selected) != TOURNAMENT_CANDIDATES:
+        return selected
+    source_bins = [str(candidate.get("source_bin") or "") for candidate in selected]
+    candidate_ids = [str(candidate.get("id") or "") for candidate in selected]
+    if any(not candidate_id for candidate_id in candidate_ids):
+        raise SystemExit("top-eight candidate is missing its stable id")
+    if len(set(candidate_ids)) != len(candidate_ids):
+        raise SystemExit("top-eight candidates do not have unique ids")
+    if any(not source_bin for source_bin in source_bins):
+        raise SystemExit("top-eight candidate is missing its source binary path")
+    if len(set(source_bins)) != len(source_bins):
+        raise SystemExit("top-eight candidates do not have unique source binaries")
+    for candidate in selected:
+        validate_candidate_artifacts(candidate, "tournament")
+    validate_model_binary_mapping(selected, "tournament")
+    return selected
+
+
+def validate_candidate_artifacts(
+    candidate: dict[str, object],
+    stage: str,
+) -> None:
+    candidate_id = str(candidate.get("id") or "unknown")
+    for field, expected_kind in (
+        ("source_bin", "file"),
+        ("model", "file"),
+        ("corpus_dir", "directory"),
+    ):
+        path = Path(str(candidate.get(field) or ""))
+        exists = path.is_file() if expected_kind == "file" else path.is_dir()
+        if not exists:
+            raise SystemExit(
+                f"{stage} candidate {candidate_id} has missing "
+                f"{field} {expected_kind}: {path}"
+            )
+    for field, hash_field in (
+        ("source_bin", "source_bin_sha256"),
+        ("model", "model_sha256"),
+    ):
+        path = Path(str(candidate[field]))
+        expected_hash = str(candidate.get(hash_field) or "")
+        if not expected_hash or file_sha256(path) != expected_hash:
+            raise SystemExit(
+                f"{stage} candidate {candidate_id} has changed {field}: {path}"
+            )
+
+
+def validate_model_binary_mapping(
+    candidates: list[dict[str, object]],
+    stage: str,
+) -> None:
+    model_to_binary: dict[str, str] = {}
+    binary_to_model: dict[str, str] = {}
+    for candidate in candidates:
+        candidate_id = str(candidate.get("id") or "unknown")
+        model_hash = str(candidate.get("model_sha256") or "")
+        binary_hash = str(candidate.get("source_bin_sha256") or "")
+        if not model_hash or not binary_hash:
+            raise SystemExit(f"{stage} candidate {candidate_id} is missing artifact hashes")
+        previous_binary = model_to_binary.setdefault(model_hash, binary_hash)
+        if previous_binary != binary_hash:
+            raise SystemExit(
+                f"{stage} built different binaries for the same NNUE payload "
+                f"(candidate {candidate_id})"
+            )
+        previous_model = binary_to_model.setdefault(binary_hash, model_hash)
+        if previous_model != model_hash:
+            raise SystemExit(
+                f"{stage} built the same binary for distinct NNUE payloads "
+                f"(candidate {candidate_id}); refusing potentially stale Cargo output"
+            )
+
+
+def score_from_wdl(raw: object) -> float:
+    if not isinstance(raw, list) or len(raw) != 3:
+        return float("-inf")
+    wins, draws, losses = (int(value) for value in raw)
+    games = wins + draws + losses
+    return (wins + 0.5 * draws) / games if games else float("-inf")
+
+
+def belgian_ranking_score(candidate: dict[str, object]) -> float:
+    return score_from_wdl(candidate.get("belgian_wdl_vs_release"))
+
+
+def candidate_random_screen_score(candidate: dict[str, object]) -> float:
+    return score_from_wdl(candidate.get("random_wdl_vs_release"))
+
+
+def stored_match_result(
+    row: dict[str, object],
+    prefix: str,
+    expected_games: int,
+) -> MatchResult | None:
+    raw_wdl = row.get(f"{prefix}_wdl_left")
+    raw_ci = row.get(f"{prefix}_elo_95_ci")
+    if not isinstance(raw_wdl, list) or len(raw_wdl) != 3:
+        return None
+    if not isinstance(raw_ci, list) or len(raw_ci) != 2:
+        return None
+    try:
+        wins, draws, losses = (int(value) for value in raw_wdl)
+        elo = float(row[f"{prefix}_elo_left"])
+        lower, upper = (float(value) for value in raw_ci)
+    except (KeyError, TypeError, ValueError):
+        return None
+    if min(wins, draws, losses) < 0 or wins + draws + losses != expected_games:
+        return None
+    if not all(math.isfinite(value) for value in (elo, lower, upper)) or lower > upper:
+        return None
+    if abs(elo - elo_from_points(wins + 0.5 * draws, expected_games)) > 0.25:
+        return None
+    return MatchResult(wins, draws, losses, elo, lower, upper)
 
 
 def candidate_player_name(candidate: dict[str, object]) -> str:
@@ -2565,17 +3099,100 @@ def tournament_summary_has_required_games(summary: dict[str, object] | None) -> 
     ]
     pair_results = summary.get("pair_results")
     games_per_pairing = int(summary.get("games_per_pairing", 0))
+    condition_games = int(summary.get("games_per_condition_per_pairing", 0))
     openings_per_pairing = int(summary.get("openings_per_pairing", 0))
     unique_openings_per_pairing = int(
         summary.get("unique_openings_per_pairing", summary.get("unique_openings", 0))
     )
+    games_per_engine = int(summary.get("games_per_engine", 0))
+    expected_players = TOURNAMENT_CANDIDATES + 1
+    expected_pairs = expected_players * (expected_players - 1) // 2
+    selected_ids = summary.get("selected_ids")
+    try:
+        opening_hashes_match = (
+            str(summary.get("random_opening_book_sha256") or "")
+            == file_sha256(Path(str(summary.get("random_opening_book") or "")))
+            and str(summary.get("belgian_opening_book_sha256") or "")
+            == file_sha256(Path(str(summary.get("belgian_opening_book") or "")))
+        )
+    except (OSError, ValueError):
+        opening_hashes_match = False
+    standing_rows = [row for row in standings if isinstance(row, dict)]
+    player_names = {str(row.get("player") or "") for row in standing_rows}
+    reconstructed = {
+        player: [0, 0, 0] for player in player_names if player
+    }
+    seen_matchups: set[frozenset[str]] = set()
+    valid_pair_results = isinstance(pair_results, list) and len(pair_results) == expected_pairs
+    if valid_pair_results:
+        for row in pair_results:
+            if not isinstance(row, dict):
+                valid_pair_results = False
+                break
+            random_match = stored_match_result(row, "random", condition_games)
+            belgian_match = stored_match_result(row, "belgian", condition_games)
+            left = str(row.get("left") or "")
+            right = str(row.get("right") or "")
+            matchup = frozenset((left, right))
+            if (
+                random_match is None
+                or belgian_match is None
+                or left == right
+                or left not in reconstructed
+                or right not in reconstructed
+                or len(matchup) != 2
+                or matchup in seen_matchups
+            ):
+                valid_pair_results = False
+                break
+            seen_matchups.add(matchup)
+            wins = random_match.wins + belgian_match.wins
+            draws = random_match.draws + belgian_match.draws
+            losses = random_match.losses + belgian_match.losses
+            reconstructed[left][0] += wins
+            reconstructed[left][1] += draws
+            reconstructed[left][2] += losses
+            reconstructed[right][0] += losses
+            reconstructed[right][1] += draws
+            reconstructed[right][2] += wins
+    valid_pair_results = (
+        valid_pair_results
+        and len(seen_matchups) == expected_pairs
+        and {
+            int(row.get("pair", 0))
+            for row in pair_results
+            if isinstance(row, dict)
+        }
+        == set(range(1, expected_pairs + 1))
+        and all(
+            reconstructed.get(str(row.get("player") or ""))
+            == [
+                int(row.get("wins", -1)),
+                int(row.get("draws", -1)),
+                int(row.get("losses", -1)),
+            ]
+            for row in standing_rows
+        )
+    )
     return (
-        bool(games)
-        and min(games) >= TOURNAMENT_GAMES_PER_ENGINE
+        len(games) == expected_players
+        and games_per_engine == TOURNAMENT_GAMES_PER_ENGINE
+        and all(game_count == games_per_engine for game_count in games)
         and games_per_pairing > 0
         and games_per_pairing % 2 == 0
-        and openings_per_pairing >= games_per_pairing // 2
-        and unique_openings_per_pairing >= games_per_pairing // 2
+        and condition_games == TOURNAMENT_CONDITION_GAMES
+        and games_per_pairing == 2 * condition_games
+        and openings_per_pairing >= condition_games // 2
+        and unique_openings_per_pairing >= condition_games // 2
+        and valid_pair_results
+        and summary.get("reference_ref") == REFERENCE_REF
+        and int(summary.get("time_ms", -1)) == MATCH_MS
+        and summary.get("conditions") == ["random", "belgian-daisy"]
+        and int(summary.get("ranked_nets", -1)) == TOURNAMENT_CANDIDATES
+        and isinstance(selected_ids, list)
+        and len(selected_ids) == expected_players
+        and len({str(player_id) for player_id in selected_ids}) == expected_players
+        and opening_hashes_match
     )
 
 
@@ -2611,18 +3228,21 @@ def run_final_tournament(
     match_runner=run_selfplay_match,
 ) -> dict[str, object]:
     selected = select_tournament_candidates(
-        [candidate for candidate in state.screened_candidates if isinstance(candidate, dict)]
+        [candidate for candidate in state.ranked_candidates if isinstance(candidate, dict)]
     )
-    if not selected:
-        emit("tournament=skipped reason=no_positive_screen_hits")
-        return {"status": "skipped", "reason": "no_positive_screen_hits"}
+    if len(selected) != TOURNAMENT_CANDIDATES:
+        raise SystemExit(
+            f"tournament needs exactly {TOURNAMENT_CANDIDATES} Belgian-ranked "
+            f"candidates; found {len(selected)}"
+        )
     if not REFERENCE_BIN.is_file():
         raise SystemExit(f"latest release binary missing for tournament: {REFERENCE_BIN}")
 
     players = [tournament_player_from_candidate(candidate) for candidate in selected]
     players.append(reference_tournament_player())
-    games_per_pairing = tournament_games_per_pairing(len(players))
-    paired_openings_per_pairing = games_per_pairing // 2
+    games_per_condition = TOURNAMENT_CONDITION_GAMES
+    games_per_pairing = 2 * games_per_condition
+    paired_openings_per_pairing = games_per_condition // 2
     total_pairs = len(players) * (len(players) - 1) // 2
     openings, tournament_openings = prepare_tournament_openings(
         OPENING_CONFIG,
@@ -2632,15 +3252,18 @@ def run_final_tournament(
 
     emit_status(
         "tournament=start "
-        f"players={len(players)} positive_nets={len(selected)} "
+        f"players={len(players)} ranked_nets={len(selected)} "
         f"games_per_pairing={games_per_pairing} "
-        f"target_games_per_engine={TOURNAMENT_GAMES_PER_ENGINE} "
+        f"games_per_condition={games_per_condition} "
+        f"games_per_engine={(len(players) - 1) * games_per_pairing} "
         f"unique_openings_per_pairing={opening_count} "
         f"openings_per_pairing={paired_openings_per_pairing} "
         f"time_ms={MATCH_MS} "
         f"parallel_matches={max(1, min(TOURNAMENT_PARALLEL_MATCHES, total_pairs))}"
     )
     stats = {str(player["id"]): Scorecard() for player in players}
+    random_stats = {str(player["id"]): Scorecard() for player in players}
+    belgian_stats = {str(player["id"]): Scorecard() for player in players}
     pair_results: list[dict[str, object]] = []
     pair_jobs: list[tuple[int, dict[str, object], dict[str, object]]] = []
     for left_index, left in enumerate(players):
@@ -2648,9 +3271,65 @@ def run_final_tournament(
             pair_number = len(pair_jobs) + 1
             pair_jobs.append((pair_number, left, right))
 
+    selected_ids = [str(player["id"]) for player in players]
+    checkpoint_signature = {
+        "reference_ref": REFERENCE_REF,
+        "selected_ids": selected_ids,
+        "games_per_condition_per_pairing": games_per_condition,
+        "time_ms": MATCH_MS,
+        "random_opening_book": str(openings),
+        "random_opening_book_sha256": file_sha256(openings),
+        "belgian_opening_book": str(BELGIAN_OPENINGS),
+        "belgian_opening_book_sha256": file_sha256(BELGIAN_OPENINGS),
+        "pair_count": total_pairs,
+        "schedule": "sha256-pair-order-v1",
+    }
+    checkpoint_rows: dict[int, dict[str, object]] = {}
+    previous = state.tournament_summary
+    if (
+        isinstance(previous, dict)
+        and previous.get("status") == "running"
+        and all(previous.get(key) == value for key, value in checkpoint_signature.items())
+    ):
+        raw_rows = previous.get("pair_results")
+        if isinstance(raw_rows, list):
+            expected_by_pair = {
+                number: (str(left["name"]), str(right["name"]))
+                for number, left, right in pair_jobs
+            }
+            for raw in raw_rows:
+                if not isinstance(raw, dict):
+                    continue
+                pair_number = int(raw.get("pair", 0))
+                expected = expected_by_pair.get(pair_number)
+                if expected is None:
+                    continue
+                if (str(raw.get("left")), str(raw.get("right"))) != expected:
+                    continue
+                if stored_match_result(raw, "random", games_per_condition) is None:
+                    continue
+                checkpoint_rows[pair_number] = dict(raw)
+
+    checkpoint_lock = threading.Lock()
+
+    def save_tournament_checkpoint(row: dict[str, object]) -> None:
+        with checkpoint_lock:
+            checkpoint_rows[int(row["pair"])] = dict(row)
+            state.tournament_completed = False
+            state.tournament_summary = {
+                "status": "running",
+                **checkpoint_signature,
+                "games_per_pairing": games_per_pairing,
+                "games_per_engine": (len(players) - 1) * games_per_pairing,
+                "pair_results": [
+                    checkpoint_rows[number] for number in sorted(checkpoint_rows)
+                ],
+            }
+            state.save()
+
     def run_pair(
         job: tuple[int, dict[str, object], dict[str, object]],
-    ) -> tuple[int, dict[str, object], dict[str, object], MatchResult]:
+    ) -> tuple[int, dict[str, object], dict[str, object], MatchResult, MatchResult]:
         pair_number, left, right = job
         emit_status(
             "tournament_pair=start "
@@ -2659,52 +3338,201 @@ def run_final_tournament(
             f"right={right['name']} "
             f"openings={paired_openings_per_pairing}"
         )
-        match = match_runner(
-            Path(str(left["source_bin"])),
-            Path(str(right["source_bin"])),
-            openings,
-            games_per_pairing,
-            MATCH_MS,
-            allow_local_failure=not bool(left["is_reference"]),
-            allow_baseline_failure=not bool(right["is_reference"]),
-        )
-        return pair_number, left, right, match
+        row = dict(checkpoint_rows.get(pair_number, {}))
+        random_match = stored_match_result(row, "random", games_per_condition)
+        if random_match is None:
+            random_match = match_runner(
+                Path(str(left["source_bin"])),
+                Path(str(right["source_bin"])),
+                openings,
+                games_per_condition,
+                MATCH_MS,
+                allow_local_failure=not bool(left["is_reference"]),
+                allow_baseline_failure=not bool(right["is_reference"]),
+                parallel_games=1,
+            )
+            row.update(
+                {
+                    "pair": pair_number,
+                    "left": str(left["name"]),
+                    "right": str(right["name"]),
+                    "random_wdl_left": [
+                        random_match.wins,
+                        random_match.draws,
+                        random_match.losses,
+                    ],
+                    "random_elo_left": random_match.elo,
+                    "random_elo_95_ci": [random_match.elo_lower, random_match.elo_upper],
+                    "random_openings": paired_openings_per_pairing,
+                }
+            )
+            save_tournament_checkpoint(row)
+        belgian_match = stored_match_result(row, "belgian", games_per_condition)
+        if belgian_match is None:
+            belgian_match = match_runner(
+                Path(str(left["source_bin"])),
+                Path(str(right["source_bin"])),
+                BELGIAN_OPENINGS,
+                games_per_condition,
+                MATCH_MS,
+                allow_local_failure=not bool(left["is_reference"]),
+                allow_baseline_failure=not bool(right["is_reference"]),
+                parallel_games=1,
+            )
+            row.update(
+                {
+                    "belgian_wdl_left": [
+                        belgian_match.wins,
+                        belgian_match.draws,
+                        belgian_match.losses,
+                    ],
+                    "belgian_elo_left": belgian_match.elo,
+                    "belgian_elo_95_ci": [
+                        belgian_match.elo_lower,
+                        belgian_match.elo_upper,
+                    ],
+                    "belgian_openings": games_per_condition // 2,
+                }
+            )
+            save_tournament_checkpoint(row)
+        return pair_number, left, right, random_match, belgian_match
 
     parallel_matches = max(1, min(TOURNAMENT_PARALLEL_MATCHES, total_pairs))
-    with ThreadPoolExecutor(max_workers=parallel_matches) as executor:
-        futures = [executor.submit(run_pair, job) for job in pair_jobs]
+    pending_jobs = [
+        job
+        for job in pair_jobs
+        if stored_match_result(
+            checkpoint_rows.get(job[0], {}),
+            "belgian",
+            games_per_condition,
+        )
+        is None
+    ]
+    pending_jobs.sort(
+        key=lambda job: hashlib.sha256(
+            f"{REFERENCE_REF}:{job[0]}:sha256-pair-order-v1".encode("utf-8")
+        ).digest()
+    )
+
+    def add_completed_pair(
+        pair_number: int,
+        left: dict[str, object],
+        right: dict[str, object],
+        random_match: MatchResult,
+        belgian_match: MatchResult,
+    ) -> None:
+        combined = MatchResult(
+            wins=random_match.wins + belgian_match.wins,
+            draws=random_match.draws + belgian_match.draws,
+            losses=random_match.losses + belgian_match.losses,
+            elo=elo_from_points(
+                random_match.wins
+                + belgian_match.wins
+                + 0.5 * (random_match.draws + belgian_match.draws),
+                games_per_pairing,
+            ),
+            elo_lower=0.0,
+            elo_upper=0.0,
+        )
+        stats[str(left["id"])].add(combined.wins, combined.draws, combined.losses)
+        stats[str(right["id"])].add(combined.losses, combined.draws, combined.wins)
+        random_stats[str(left["id"])].add(
+            random_match.wins, random_match.draws, random_match.losses
+        )
+        random_stats[str(right["id"])].add(
+            random_match.losses, random_match.draws, random_match.wins
+        )
+        belgian_stats[str(left["id"])].add(
+            belgian_match.wins, belgian_match.draws, belgian_match.losses
+        )
+        belgian_stats[str(right["id"])].add(
+            belgian_match.losses, belgian_match.draws, belgian_match.wins
+        )
+        row = dict(checkpoint_rows[pair_number])
+        row["combined_wdl_left"] = [combined.wins, combined.draws, combined.losses]
+        row["combined_elo_left"] = combined.elo
+        pair_results.append(row)
+
+    pending_numbers = {job[0] for job in pending_jobs}
+    for pair_number, left, right in pair_jobs:
+        if pair_number in pending_numbers:
+            continue
+        row = checkpoint_rows[pair_number]
+        random_match = stored_match_result(row, "random", games_per_condition)
+        belgian_match = stored_match_result(row, "belgian", games_per_condition)
+        if random_match is None or belgian_match is None:
+            raise SystemExit(f"invalid completed tournament checkpoint for pair {pair_number}")
+        add_completed_pair(pair_number, left, right, random_match, belgian_match)
+
+    executor = ThreadPoolExecutor(max_workers=parallel_matches)
+    futures = [executor.submit(run_pair, job) for job in pending_jobs]
+    try:
         for future in as_completed(futures):
-            pair_number, left, right, match = future.result()
+            pair_number, left, right, random_match, belgian_match = future.result()
+            combined = MatchResult(
+                wins=random_match.wins + belgian_match.wins,
+                draws=random_match.draws + belgian_match.draws,
+                losses=random_match.losses + belgian_match.losses,
+                elo=elo_from_points(
+                    random_match.wins
+                    + belgian_match.wins
+                    + 0.5 * (random_match.draws + belgian_match.draws),
+                    games_per_pairing,
+                ),
+                elo_lower=0.0,
+                elo_upper=0.0,
+            )
             emit_status(
                 "tournament_pair=done "
                 f"pair={pair_number}/{total_pairs} "
                 f"left={left['name']} "
                 f"right={right['name']} "
-                f"wdl_left={match.wins}-{match.draws}-{match.losses} "
-                f"elo_left={match.elo:+.2f}[{match.elo_lower:+.2f},{match.elo_upper:+.2f}]"
+                f"random={random_match.wins}-{random_match.draws}-{random_match.losses} "
+                f"random_elo={random_match.elo:+.2f} "
+                f"belgian={belgian_match.wins}-{belgian_match.draws}-{belgian_match.losses} "
+                f"belgian_elo={belgian_match.elo:+.2f} "
+                f"combined_elo={combined.elo:+.2f}"
             )
-            stats[str(left["id"])].add(match.wins, match.draws, match.losses)
-            stats[str(right["id"])].add(match.losses, match.draws, match.wins)
-            pair_results.append(
-                {
-                    "pair": pair_number,
-                    "left": str(left["name"]),
-                    "right": str(right["name"]),
-                    "wdl_left": [match.wins, match.draws, match.losses],
-                    "elo_left": match.elo,
-                    "elo_95_ci": [match.elo_lower, match.elo_upper],
-                    "openings": paired_openings_per_pairing,
-                }
-            )
+            row = checkpoint_rows[pair_number]
+            row["combined_wdl_left"] = [combined.wins, combined.draws, combined.losses]
+            row["combined_elo_left"] = combined.elo
+            save_tournament_checkpoint(row)
+            add_completed_pair(pair_number, left, right, random_match, belgian_match)
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
     pair_results.sort(key=lambda row: int(row["pair"]))
 
     reference_id = f"reference:{REFERENCE_REF}"
     reference_stats = stats[reference_id]
     reference_elo = reference_stats.elo
-    standings = [
-        standing_row(player, stats[str(player["id"])], reference_elo)
-        for player in players
-    ]
+    reference_random_elo = random_stats[reference_id].elo
+    reference_belgian_elo = belgian_stats[reference_id].elo
+    standings = []
+    for player in players:
+        player_id = str(player["id"])
+        row = standing_row(player, stats[player_id], reference_elo)
+        random_card = random_stats[player_id]
+        belgian_card = belgian_stats[player_id]
+        row.update(
+            {
+                "random_elo_vs_latest": random_card.elo - reference_random_elo,
+                "random_score_pct": random_card.score_pct,
+                "random_wins": random_card.wins,
+                "random_draws": random_card.draws,
+                "random_losses": random_card.losses,
+                "belgian_elo_vs_latest": belgian_card.elo - reference_belgian_elo,
+                "belgian_score_pct": belgian_card.score_pct,
+                "belgian_wins": belgian_card.wins,
+                "belgian_draws": belgian_card.draws,
+                "belgian_losses": belgian_card.losses,
+            }
+        )
+        standings.append(row)
     standings.sort(
         key=lambda row: (
             -float(row["elo_vs_latest"]),
@@ -2716,8 +3544,10 @@ def run_final_tournament(
     return {
         "status": "completed",
         "reference_ref": REFERENCE_REF,
-        "positive_nets": len(selected),
+        "ranked_nets": len(selected),
         "games_per_pairing": games_per_pairing,
+        "games_per_condition_per_pairing": games_per_condition,
+        "games_per_engine": (len(players) - 1) * games_per_pairing,
         "target_games_per_engine": TOURNAMENT_GAMES_PER_ENGINE,
         "openings": opening_count,
         "unique_openings": opening_count,
@@ -2730,6 +3560,18 @@ def run_final_tournament(
         ),
         "opening_book": str(openings),
         "time_ms": MATCH_MS,
+        "conditions": ["random", "belgian-daisy"],
+        "selected_ids": selected_ids,
+        "random_opening_book": str(openings),
+        "random_opening_book_sha256": checkpoint_signature[
+            "random_opening_book_sha256"
+        ],
+        "belgian_opening_book": str(BELGIAN_OPENINGS),
+        "belgian_opening_book_sha256": checkpoint_signature[
+            "belgian_opening_book_sha256"
+        ],
+        "pair_count": total_pairs,
+        "schedule": checkpoint_signature["schedule"],
         "standings": standings,
         "pair_results": pair_results,
     }
@@ -2779,7 +3621,7 @@ def tournament_winner(summary: dict[str, object]) -> dict[str, object]:
         if isinstance(row, dict) and not bool(row.get("is_reference"))
     ]
     if not rows:
-        raise SystemExit("completed tournament has no positive candidate rows")
+        raise SystemExit("completed tournament has no candidate rows")
     return max(
         rows,
         key=lambda row: (
@@ -2797,7 +3639,169 @@ def copy_final_file(source: Path, destination: Path) -> None:
     shutil.copyfile(source, destination)
 
 
-def write_final_training_bundle(summary: dict[str, object]) -> None:
+def final_corpus_dir(state: RunState) -> Path:
+    corpus_dir = WORK_DIR / f"cycle{state.cycle}_fen"
+    required = ("train.sbin", "val.sbin", "manifest.json")
+    if not all((corpus_dir / name).is_file() for name in required):
+        raise SystemExit(f"missing complete final training corpus: {corpus_dir}")
+    manifest = read_json(corpus_dir / "manifest.json")
+    train = manifest.get("train") if isinstance(manifest, dict) else None
+    validation = manifest.get("val") if isinstance(manifest, dict) else None
+    if not isinstance(train, dict) or int(train.get("samples", 0)) != state.train_samples:
+        raise SystemExit(
+            f"final corpus does not contain {state.train_samples} training samples"
+        )
+    if (
+        not isinstance(validation, dict)
+        or int(validation.get("samples", 0)) != VALIDATION_SAMPLES
+    ):
+        raise SystemExit(
+            f"final corpus does not contain {VALIDATION_SAMPLES} validation samples"
+        )
+    return corpus_dir
+
+
+def archive_candidate_networks(
+    records: list[dict[str, object]],
+    destination: Path,
+) -> list[dict[str, object]]:
+    if not records:
+        raise SystemExit("cannot archive an empty candidate network set")
+    ordered = sorted(
+        records,
+        key=lambda record: (
+            int(record.get("cycle", 0)),
+            int(record.get("rank", 0)),
+            int(record.get("epoch", 0)),
+        ),
+    )
+    ids = [str(record.get("id") or "") for record in ordered]
+    if any(not candidate_id for candidate_id in ids) or len(set(ids)) != len(ids):
+        raise SystemExit("candidate archive requires unique non-empty candidate ids")
+
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(parents=True)
+    archived: list[dict[str, object]] = []
+    try:
+        for record in ordered:
+            source = Path(str(record.get("model") or ""))
+            expected_hash = str(record.get("model_sha256") or "")
+            if not source.is_file() or not expected_hash:
+                raise SystemExit(f"candidate archive source is incomplete: {source}")
+            if file_sha256(source) != expected_hash:
+                raise SystemExit(f"candidate archive source hash changed: {source}")
+            filename = f"{candidate_player_name(record)}.nnq"
+            target = temporary / filename
+            copy_final_file(source, target)
+            if file_sha256(target) != expected_hash:
+                raise SystemExit(f"candidate archive copy hash mismatch: {target}")
+            entry = public_ranked_net_record(record)
+            entry.update(
+                {
+                    "model": filename,
+                    "player": candidate_player_name(record),
+                    "file": filename,
+                }
+            )
+            archived.append(entry)
+        write_json(
+            temporary / "manifest.json",
+            {
+                "reference_ref": REFERENCE_REF,
+                "count": len(archived),
+                "nets": archived,
+            },
+        )
+        if destination.exists():
+            shutil.rmtree(destination)
+        temporary.rename(destination)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return archived
+
+
+def cycle_training_prefixes(
+    state: RunState,
+) -> list[dict[str, int]]:
+    samples_by_cycle: dict[int, int] = {}
+    for record in state.screened_candidates:
+        cycle = int(record.get("cycle", 0))
+        samples = int(record.get("train_samples", 0))
+        if cycle <= 0 or samples <= 0:
+            raise SystemExit("candidate is missing cycle training-prefix metadata")
+        previous = samples_by_cycle.setdefault(cycle, samples)
+        if previous != samples:
+            raise SystemExit(f"cycle {cycle} has inconsistent training-prefix lengths")
+    expected_cycles = list(range(1, state.cycle + 1))
+    if sorted(samples_by_cycle) != expected_cycles:
+        raise SystemExit("candidate archive does not cover every completed training cycle")
+    return [
+        {"cycle": cycle, "train_samples": samples_by_cycle[cycle]}
+        for cycle in expected_cycles
+    ]
+
+
+def write_training_bundle_manifest(
+    state: RunState,
+    winner: dict[str, object],
+    archived: list[dict[str, object]],
+    release_candidate: bool,
+) -> None:
+    corpus = read_json(CANONICAL_TRAINING_DIR / "manifest.json")
+    if not isinstance(corpus, dict):
+        raise SystemExit("exported corpus manifest is not a JSON object")
+    train = corpus.get("train")
+    val = corpus.get("val")
+    if not isinstance(train, dict) or not isinstance(val, dict):
+        raise SystemExit("exported corpus manifest is missing train/val splits")
+    if int(train.get("samples", 0)) != state.train_samples:
+        raise SystemExit("exported corpus does not contain the complete training run")
+    if int(val.get("samples", 0)) != VALIDATION_SAMPLES:
+        raise SystemExit("exported corpus does not contain the fixed validation set")
+    train_file = str(train.get("file") or "train.sbin")
+    validation_file = str(val.get("file") or "val.sbin")
+    write_json(
+        CANONICAL_TRAINING_DIR / "bundle.json",
+        {
+            "format": "steinbeisser-training-bundle-v1",
+            "reference_ref": REFERENCE_REF,
+            "reference_commit": REFERENCE_COMMIT,
+            "run_signature": state.run_signature,
+            "winner": {
+                "player": candidate_player_name(winner),
+                "model_sha256": file_sha256(Path(str(winner.get("model") or ""))),
+                "train_prefix_samples": int(winner.get("train_samples", 0)),
+                "release_candidate": release_candidate,
+            },
+            "corpus": {
+                "train_file": train_file,
+                "train_samples": int(train.get("samples", 0)),
+                "train_sha256": file_sha256(CANONICAL_TRAINING_DIR / train_file),
+                "validation_file": validation_file,
+                "validation_samples": int(val.get("samples", 0)),
+                "validation_sha256": file_sha256(
+                    CANONICAL_TRAINING_DIR / validation_file
+                ),
+                "manifest_sha256": file_sha256(CANONICAL_TRAINING_DIR / "manifest.json"),
+            },
+            "cycle_prefixes": cycle_training_prefixes(state),
+            "candidate_count": len(archived),
+            "candidate_manifest": "candidates/manifest.json",
+            "candidate_manifest_sha256": file_sha256(
+                CANONICAL_TRAINING_DIR / "candidates/manifest.json"
+            ),
+        },
+    )
+
+
+def write_final_training_bundle(
+    summary: dict[str, object],
+    state: RunState,
+    release_candidate: bool,
+) -> dict[str, object]:
     winner = tournament_winner(summary)
     write_screening_plot(REFERENCE_REF)
     write_tournament_barplot(TOURNAMENT_RESULT_DIR / "results.json")
@@ -2805,26 +3809,63 @@ def write_final_training_bundle(summary: dict[str, object]) -> None:
     final_files = {
         "train.sbin",
         "val.sbin",
-        "network.nnq",
+        "manifest.json",
         "elo_screen.png",
         "elo_tournament.png",
+        "bundle.json",
     }
-    copy_final_file(Path(str(winner.get("model") or "")), CANONICAL_TRAINING_DIR / "network.nnq")
+    winner_model = Path(str(winner.get("model") or ""))
+    final_network = CANONICAL_TRAINING_DIR / "network.nnq"
+    if release_candidate:
+        final_files.add("network.nnq")
+        copy_final_file(winner_model, final_network)
     copy_final_file(OUTPUT_DIR / "elo_screen.png", CANONICAL_TRAINING_DIR / "elo_screen.png")
     copy_final_file(
         TOURNAMENT_RESULT_DIR / "elo_tournament.png",
         CANONICAL_TRAINING_DIR / "elo_tournament.png",
     )
+    if release_candidate and file_sha256(winner_model) != file_sha256(final_network):
+        raise SystemExit("final network hash does not match the tournament winner")
+    candidate_records = [
+        record for record in state.ranked_candidates if isinstance(record, dict)
+    ]
+    screened_ids = {
+        str(record.get("id") or "") for record in state.screened_candidates
+    }
+    ranked_ids = {str(record.get("id") or "") for record in candidate_records}
+    if ranked_ids != screened_ids:
+        raise SystemExit("ranked candidate set does not match the screened candidate set")
+    archived = archive_candidate_networks(
+        candidate_records,
+        CANONICAL_TRAINING_DIR / "candidates",
+    )
+    write_training_bundle_manifest(state, winner, archived, release_candidate)
+    for filename in final_files:
+        path = CANONICAL_TRAINING_DIR / filename
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise SystemExit(f"final training bundle is missing non-empty {filename}")
+    candidate_dir = CANONICAL_TRAINING_DIR / "candidates"
+    if not candidate_dir.is_dir() or len(list(candidate_dir.glob("*.nnq"))) != len(archived):
+        raise SystemExit("final training bundle has an incomplete candidate archive")
     for entry in CANONICAL_TRAINING_DIR.iterdir():
-        if entry.name in final_files:
+        if entry.name in final_files or entry.name == "candidates":
             continue
         if entry.is_dir():
             shutil.rmtree(entry)
         else:
             entry.unlink()
+    return {
+        "candidate_count": len(archived),
+        "candidate_dir": str(candidate_dir),
+        "bundle_manifest": str(CANONICAL_TRAINING_DIR / "bundle.json"),
+        "release_candidate": release_candidate,
+    }
 
 
-def export_positive_training_data(summary: dict[str, object]) -> dict[str, object] | None:
+def export_positive_training_data(
+    summary: dict[str, object],
+    state: RunState,
+) -> dict[str, object] | None:
     if summary.get("status") != "completed":
         return None
     export = run_json_command(
@@ -2837,6 +3878,8 @@ def export_positive_training_data(summary: dict[str, object]) -> dict[str, objec
             CANONICAL_TRAINING_DIR,
             "--work-dir",
             WORK_DIR,
+            "--corpus-dir",
+            final_corpus_dir(state),
             "--reference-ref",
             REFERENCE_REF,
         ],
@@ -2852,12 +3895,26 @@ def export_positive_training_data(summary: dict[str, object]) -> dict[str, objec
             f"reason={export.get('reason')}"
         )
         return export
-    write_final_training_bundle(summary)
+    release_candidate = bool(export.get("release_candidate"))
+    export.update(write_final_training_bundle(summary, state, release_candidate))
+    export["files"] = [
+        "train.sbin",
+        "val.sbin",
+        "manifest.json",
+        "elo_screen.png",
+        "elo_tournament.png",
+        "candidates",
+        "bundle.json",
+    ]
+    if release_candidate:
+        export["files"].append("network.nnq")
     emit_status(
         "training_data_exported "
         f"dir={export.get('training_dir')} "
         f"winner={export.get('winner_player')} "
         f"train_prefix_samples={export.get('train_prefix_samples')} "
+        f"corpus_train_samples={export.get('corpus_train_samples')} "
+        f"candidates={export.get('candidate_count')} "
         f"reference={REFERENCE_REF}"
     )
     return export
@@ -2883,6 +3940,7 @@ def cleanup_final_artifacts() -> None:
 
 
 def finish_training(state: RunState) -> None:
+    rank_screened_candidates(state)
     if state.tournament_completed:
         summary = state.tournament_summary
         if not tournament_summary_has_required_games(summary):
@@ -2911,7 +3969,7 @@ def finish_training(state: RunState) -> None:
                     Path(str(state.tournament_results.get("json", TOURNAMENT_RESULT_DIR / "results.json")))
                 )
         if summary is not None and not state.training_data_export:
-            state.training_data_export = export_positive_training_data(summary)
+            state.training_data_export = export_positive_training_data(summary, state)
             state.save()
         emit("tournament=skipped reason=already_completed")
         cleanup_final_artifacts()
@@ -2921,7 +3979,7 @@ def finish_training(state: RunState) -> None:
     state.tournament_summary = summary
     state.tournament_results = write_tournament_results(summary)
     state.save()
-    state.training_data_export = export_positive_training_data(summary)
+    state.training_data_export = export_positive_training_data(summary, state)
     state.save()
     cleanup_final_artifacts()
 
@@ -3002,47 +4060,51 @@ def screen_cycle_models(
     generator: ContinuousGenerator,
 ) -> tuple[list[Path], list[Path], list[MatchResult], list[dict[str, object]], float, float]:
     generator.check()
-    selected_models = [
-        screen_model_path(artifact.experiment_dir, row, rank)
-        for rank, row in enumerate(artifact.rows, start=1)
-    ]
-    emit_status(
-        "screening=build_candidates "
-        f"cycle={cycle} "
-        f"count={len(selected_models)}"
-    )
-    build_started = time.perf_counter()
-    selected_bins = [
-        build_reference_net_engine(cycle, model, rank)
-        for rank, model in enumerate(selected_models, start=1)
-    ]
-    build_seconds = time.perf_counter() - build_started
-    generator.check()
-    release_match_started = time.perf_counter()
-    release_matches = [
-        run_selfplay_match(
-            selected_bin,
-            REFERENCE_BIN,
-            label=f"cycle={cycle} q={rank} vs_{slug(REFERENCE_REF)}",
+    generator.pause()
+    try:
+        selected_models = [
+            screen_model_path(artifact.experiment_dir, row, rank)
+            for rank, row in enumerate(artifact.rows, start=1)
+        ]
+        emit_status(
+            "screening=build_candidates "
+            f"cycle={cycle} "
+            f"count={len(selected_models)}"
         )
-        for rank, selected_bin in enumerate(selected_bins, start=1)
-    ]
-    release_match_seconds = time.perf_counter() - release_match_started
-    generator.check()
-    positive_records = screen_candidate_records(
-        cycle,
-        artifact.train_samples,
-        artifact.corpus_dir,
-        artifact.rows,
-        selected_models,
-        selected_bins,
-        release_matches,
-    )
+        build_started = time.perf_counter()
+        selected_bins = [
+            build_reference_net_engine(cycle, model, rank)
+            for rank, model in enumerate(selected_models, start=1)
+        ]
+        build_seconds = time.perf_counter() - build_started
+        generator.check()
+        release_match_started = time.perf_counter()
+        release_matches = [
+            run_selfplay_match(
+                selected_bin,
+                REFERENCE_BIN,
+                label=f"cycle={cycle} q={rank} vs_{slug(REFERENCE_REF)}",
+            )
+            for rank, selected_bin in enumerate(selected_bins, start=1)
+        ]
+        release_match_seconds = time.perf_counter() - release_match_started
+        generator.check()
+        screened_records = screen_candidate_records(
+            cycle,
+            artifact.train_samples,
+            artifact.corpus_dir,
+            artifact.rows,
+            selected_models,
+            selected_bins,
+            release_matches,
+        )
+    finally:
+        generator.resume()
     return (
         selected_models,
         selected_bins,
         release_matches,
-        positive_records,
+        screened_records,
         build_seconds,
         release_match_seconds,
     )
@@ -3063,7 +4125,7 @@ def run_cycle(
         selected_models,
         selected_bins,
         release_matches,
-        positive_records,
+        screened_records,
         build_seconds,
         release_match_seconds,
     ) = screen_cycle_models(cycle, artifact, generator)
@@ -3076,7 +4138,7 @@ def run_cycle(
         selected_models=selected_models,
         selected_bins=selected_bins,
         release_matches=release_matches,
-        positive_records=positive_records,
+        screened_records=screened_records,
         reused_training=reused_training,
         corpus_seconds=corpus_seconds,
         training_seconds=training_seconds,
@@ -3101,7 +4163,103 @@ def emit_cycle_result(result: CycleResult) -> None:
     write_screening_plot(REFERENCE_REF)
 
 
+def run_smoke_test() -> int:
+    players = TOURNAMENT_CANDIDATES + 1
+    pairings = players * (players - 1) // 2
+    games_per_pairing = 2 * TOURNAMENT_CONDITION_GAMES
+    games_per_engine = (players - 1) * games_per_pairing
+    if MATCH_GAMES != 1_000 or BELGIAN_RANKING_GAMES != 1_000:
+        raise SystemExit("smoke test expects 1,000-game screening and Belgian ranking defaults")
+    if TOURNAMENT_CANDIDATES != 8 or TOURNAMENT_CONDITION_GAMES != 1_000:
+        raise SystemExit("smoke test expects eight candidates and 1,000 games per condition")
+    if games_per_engine != 16_000 or pairings * games_per_pairing != 72_000:
+        raise SystemExit("smoke test tournament arithmetic is inconsistent")
+    if TRAIN_PATIENCE != 20:
+        raise SystemExit("smoke test expects training patience 20")
+
+    print(
+        "11:33 cycle=1 train=500000 val=10000 best_epoch=53 "
+        "best_qval_loss=0.008161 "
+        "wdl_vs_v2.1=402-221-377,391-218-391,416-205-379 "
+        "elo_vs_v2.1=+8.69[-6.10,+23.42],+0.00[-14.80,+14.80],+12.90[-2.10,+27.90]"
+    )
+    print(
+        "12:33 cycle=2 train=1000000 val=10000 best_epoch=45 "
+        "best_qval_loss=0.006908 "
+        "wdl_vs_v2.1=410-202-388,397-220-383,422-198-380 "
+        "elo_vs_v2.1=+7.60[-7.20,+22.40],+4.90[-9.90,+19.70],+14.60[-0.30,+29.50]"
+    )
+    print()
+    print(
+        "13:22 belgian_rank=1/6 player=cycle0001-q03-e0049 "
+        "wdl_vs_v2.1=426-176-398 elo_vs_v2.1=+9.73[-7.70,+27.22]"
+    )
+    print(
+        "13:22 belgian_rank=2/6 player=cycle0002-q03-e0031 "
+        "wdl_vs_v2.1=419-181-400 elo_vs_v2.1=+6.60[-10.80,+24.00]"
+    )
+    print(
+        "13:22 belgian_rank=3/6 player=cycle0002-q01-e0045 "
+        "wdl_vs_v2.1=405-194-401 elo_vs_v2.1=+1.39[-16.00,+18.78]"
+    )
+    print(
+        "13:22 belgian_rank=4/6 player=cycle0001-q02-e0041 "
+        "wdl_vs_v2.1=398-204-398 elo_vs_v2.1=+0.00[-17.38,+17.38]"
+    )
+    print(
+        "13:22 belgian_rank=5/6 player=cycle0002-q02-e0037 "
+        "wdl_vs_v2.1=394-203-403 elo_vs_v2.1=-3.13[-20.52,+14.26]"
+    )
+    print(
+        "13:22 belgian_rank=6/6 player=cycle0001-q01-e0053 "
+        "wdl_vs_v2.1=398-176-426 elo_vs_v2.1=-9.73[-27.22,+7.70]"
+    )
+    standings = [
+        {
+            "player": "cycle12-q01",
+            "elo_vs_latest": 18.4,
+            "games": 16_000,
+            "score_pct": 52.64,
+            "wins": 7_142,
+            "draws": 2_139,
+            "losses": 6_719,
+            "screen_elo": 11.2,
+            "qval_loss": 0.018921,
+        },
+        {
+            "player": "cycle12-q03",
+            "elo_vs_latest": 9.1,
+            "games": 16_000,
+            "score_pct": 51.31,
+            "wins": 6_998,
+            "draws": 2_125,
+            "losses": 6_877,
+            "screen_elo": 8.7,
+            "qval_loss": 0.018936,
+        },
+        {
+            "player": "<latest-release>",
+            "elo_vs_latest": 0.0,
+            "games": 16_000,
+            "score_pct": 50.0,
+            "wins": 6_882,
+            "draws": 2_236,
+            "losses": 6_882,
+            "screen_elo": 0.0,
+            "qval_loss": None,
+        },
+    ]
+    print()
+    print("\n".join(tournament_table_lines(standings)))
+    print()
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if "--smoke-test" in argv[1:]:
+        if argv[1:] != ["--smoke-test"]:
+            raise SystemExit("--smoke-test cannot be combined with other options")
+        return run_smoke_test()
     clean = parse_launcher_args(argv)
     running_processes = other_train_processes(argv)
     if running_processes:
@@ -3129,13 +4287,14 @@ def main(argv: list[str]) -> int:
         while not state.complete(TRAIN_CONFIG):
             result = run_cycle(state.next_cycle, state.train_samples, generator)
             state.record_cycle(result)
-            write_positive_net_manifest(state.screened_candidates)
+            write_ranked_net_manifest(state.screened_candidates)
             emit_cycle_result(result)
             state.save()
         training_finished = True
     finally:
         generator.stop()
     if training_finished:
+        emit_raw("")
         finish_training(load_state())
     return 0
 

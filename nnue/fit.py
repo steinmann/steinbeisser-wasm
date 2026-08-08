@@ -29,7 +29,14 @@ def read_json(path: Path, default: object | None = None) -> object:
 
 def write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    temporary = path.with_name(
+        f".{path.name}.tmp-{os.getpid()}-{time.time_ns()}"
+    )
+    try:
+        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -2216,7 +2223,7 @@ def trainer_main(argv: list[str] | None = None) -> int:
         min_learning_rate=0.00003,
         weight_decay=0.0007,
         warmup_epochs=5,
-        patience=10,
+        patience=env_int("STEINBEISSER_NNUE_PATIENCE", 20),
         screen_checkpoint_count=env_int("STEINBEISSER_TRAIN_SCREEN_CHECKPOINTS", 3),
         runtime_loss_interval=1,
         ema_decay=0.9999,

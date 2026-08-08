@@ -82,6 +82,6 @@ fn print_usage() {
         "usage: nnue feature-schema\n       nnue runtime-loss --model <model.json|model.nnq> --dataset <val.sbin>\n       nnue prepare-dataset --dataset <train.sbin> --out-dir <cache-dir> --manifest <manifest.json>\n       nnue corpus-build --shards <dir> --work-dir <dir> --cycle <n>"
     );
     println!(
-        "       nnue materialize-candidate --repo <repo> --reference-ref <ref> --model <model.nnq> --source-dir <dir> --target <bin> --target-dir <cargo-target>\n       nnue screen-match --selfplay-bin <nnue-selfplay> --repo <repo> --candidate <bin> --baseline <bin> --openings <fen> --games <n> --time-ms <ms>\n       nnue export-results --summary <summary.json> --out-dir <dir>\n       nnue export-positive-training-data --summary <summary.json> --out-dir <dir> --work-dir <dir> --reference-ref <ref>"
+        "       nnue materialize-candidate --repo <repo> --reference-ref <ref> --model <model.nnq> --source-dir <dir> --target <bin> --target-dir <cargo-target>\n       nnue screen-match --selfplay-bin <nnue-selfplay> --repo <repo> --candidate <bin> --baseline <bin> --openings <fen> --games <n> --time-ms <ms> [--parallel-games <n>]\n       nnue export-results --summary <summary.json> --out-dir <dir>\n       nnue export-positive-training-data --summary <summary.json> --out-dir <dir> --work-dir <dir> [--corpus-dir <dir>] --reference-ref <ref>"
     );
 }

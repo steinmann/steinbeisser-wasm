@@ -170,7 +170,8 @@ fn materialize_reference_source(
         .arg("--format=tar")
         .arg("--output")
         .arg(&archive)
-        .arg(reference_ref);
+        .arg(reference_ref)
+        .arg("engine");
     run_command(&mut git)?;
 
     let mut tar = Command::new("tar");

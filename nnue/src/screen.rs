@@ -13,6 +13,7 @@ struct ScreenMatchArgs {
     baseline: PathBuf,
     openings: PathBuf,
     games: usize,
+    parallel_games: usize,
     time_ms: u64,
     seed: u64,
     github_ref: String,
@@ -52,6 +53,7 @@ where
     let mut openings = None::<PathBuf>;
     let mut games = None::<usize>;
     let mut time_ms = None::<u64>;
+    let mut parallel_games = 1usize;
     let mut seed = None::<u64>;
     let mut github_ref = "baseline".to_owned();
     let mut allow_local_failure = false;
@@ -70,12 +72,15 @@ where
             }
             "--games" => games = Some(parse_value(&required_value(&mut args, "--games")?, &flag)?),
             "--time-ms" => time_ms = Some(parse_value(&required_value(&mut args, &flag)?, &flag)?),
+            "--parallel-games" => {
+                parallel_games = parse_value(&required_value(&mut args, &flag)?, &flag)?
+            }
             "--seed" => seed = Some(parse_value(&required_value(&mut args, "--seed")?, &flag)?),
             "--github-ref" => github_ref = required_value(&mut args, "--github-ref")?,
             "--allow-local-failure" => allow_local_failure = true,
             "--allow-baseline-failure" => allow_baseline_failure = true,
             _ => bail!(
-                "unknown argument {flag}; usage: nnue screen-match --selfplay-bin <nnue-selfplay> --repo <repo> --candidate <bin> --baseline <bin> --openings <fen> --games <n> --time-ms <ms>"
+                "unknown argument {flag}; usage: nnue screen-match --selfplay-bin <nnue-selfplay> --repo <repo> --candidate <bin> --baseline <bin> --openings <fen> --games <n> --time-ms <ms> [--parallel-games <n>]"
             ),
         }
     }
@@ -87,6 +92,7 @@ where
         baseline: baseline.ok_or_else(|| anyhow::anyhow!("missing required --baseline"))?,
         openings: openings.ok_or_else(|| anyhow::anyhow!("missing required --openings"))?,
         games: games.ok_or_else(|| anyhow::anyhow!("missing required --games"))?,
+        parallel_games,
         time_ms: time_ms.ok_or_else(|| anyhow::anyhow!("missing required --time-ms"))?,
         seed: seed.unwrap_or(1),
         github_ref,
@@ -110,6 +116,12 @@ fn parse_value<T: std::str::FromStr>(value: &str, flag: &str) -> Result<T> {
 }
 
 fn run_screen_match(args: &ScreenMatchArgs) -> Result<MatchSummary> {
+    if args.games == 0 || args.games % 2 != 0 {
+        bail!("--games must be a positive even number");
+    }
+    if args.parallel_games == 0 {
+        bail!("--parallel-games must be positive");
+    }
     let output = Command::new(&args.selfplay_bin)
         .arg("match")
         .arg("--repo")
@@ -122,6 +134,8 @@ fn run_screen_match(args: &ScreenMatchArgs) -> Result<MatchSummary> {
         .arg(&args.openings)
         .arg("--pairs")
         .arg((args.games / 2).to_string())
+        .arg("--parallel-games")
+        .arg(args.parallel_games.to_string())
         .arg("--time")
         .arg(args.time_ms.to_string())
         .arg("--seed")
@@ -198,6 +212,9 @@ fn failed_match_result(text: &str, args: &ScreenMatchArgs) -> Option<MatchSummar
         || match_output_count(&lower, "github_illegal") > 0
         || match_output_count(&lower, "github_errors") > 0
         || (lower.contains(&baseline_path) && path_failure_marker(&lower));
+    if local_failed && baseline_failed {
+        return None;
+    }
     if local_failed {
         return args
             .allow_local_failure
@@ -215,9 +232,8 @@ fn failed_match_result(text: &str, args: &ScreenMatchArgs) -> Option<MatchSummar
         if args.allow_baseline_failure && !args.allow_local_failure {
             return Some(forfeit_match_result(args.games, 0, 0));
         }
-        if args.allow_local_failure && args.allow_baseline_failure {
-            return Some(forfeit_match_result(0, 0, args.games));
-        }
+        // With two fallible candidates there is no sound way to attribute an
+        // anonymous protocol failure. Abort instead of biasing the left side.
     }
     None
 }
@@ -297,4 +313,51 @@ fn parse_f64(value: Option<&str>, label: &str) -> Result<f64> {
         .ok_or_else(|| anyhow::anyhow!("match output is missing {label}"))?
         .parse()
         .with_context(|| format!("bad {label}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure_args(allow_local: bool, allow_baseline: bool) -> ScreenMatchArgs {
+        ScreenMatchArgs {
+            selfplay_bin: PathBuf::from("selfplay"),
+            repo: PathBuf::from("."),
+            candidate: PathBuf::from("candidate"),
+            baseline: PathBuf::from("baseline"),
+            openings: PathBuf::from("openings.fen"),
+            games: 1_000,
+            parallel_games: 15,
+            time_ms: 5,
+            seed: 1,
+            github_ref: "v2.1".to_owned(),
+            allow_local_failure: allow_local,
+            allow_baseline_failure: allow_baseline,
+        }
+    }
+
+    #[test]
+    fn attributes_identified_single_engine_failure() {
+        let result = failed_match_result(
+            "illegal engine reply from local",
+            &failure_args(true, false),
+        )
+        .expect("identified local failure should be attributable");
+        assert_eq!((result.wins, result.draws, result.losses), (0, 0, 1_000));
+        assert!(result.forfeit);
+    }
+
+    #[test]
+    fn refuses_to_attribute_ambiguous_two_candidate_failure() {
+        assert!(
+            failed_match_result("bad reply", &failure_args(true, true)).is_none()
+        );
+        assert!(
+            failed_match_result(
+                "illegal engine reply from local\nillegal engine reply from github",
+                &failure_args(true, true),
+            )
+            .is_none()
+        );
+    }
 }
