@@ -96,30 +96,45 @@ impl PositionState {
         let occupied_bits = side_bits | enemy_bits;
         let tables = crate::search::fast_movegen_tables();
         moves.clear();
-        for group in &tables.source_groups {
-            if side_bits & group.source_mask != group.source_mask {
-                continue;
+        let mut candidate_group_bits = [0u64; 6];
+        let mut anchors = side_bits;
+        while anchors != 0 {
+            let anchor = anchors.trailing_zeros() as usize;
+            let indexed = &tables.anchor_group_bits[anchor];
+            for word in 0..candidate_group_bits.len() {
+                candidate_group_bits[word] |= indexed[word];
             }
-            for direction in group.directions.iter().flatten() {
-                let Some((is_push, is_ejection, enemy_effect)) = self
-                    .fast_group_direction_legality(
-                        group.len as usize,
-                        direction,
-                        side_bits,
-                        enemy_bits,
-                        occupied_bits,
-                    )
-                else {
+            anchors &= anchors - 1;
+        }
+        for (word_index, mut groups) in candidate_group_bits.into_iter().enumerate() {
+            while groups != 0 {
+                let bit_index = groups.trailing_zeros() as usize;
+                groups &= groups - 1;
+                let group = &tables.source_groups[word_index * 64 + bit_index];
+                if side_bits & group.source_mask != group.source_mask {
                     continue;
-                };
-                moves.push(crate::search::LegalMoveEntry {
-                    candidate_move: direction.candidate_move,
-                    is_ejection,
-                    is_push,
-                    history_key: direction.history_key,
-                    plan_index: direction.plan_index,
-                    enemy_effect,
-                });
+                }
+                for direction in group.directions.iter().flatten() {
+                    let Some((is_push, is_ejection, enemy_effect)) = self
+                        .fast_group_direction_legality(
+                            group.len as usize,
+                            direction,
+                            side_bits,
+                            enemy_bits,
+                            occupied_bits,
+                        )
+                    else {
+                        continue;
+                    };
+                    moves.push(crate::search::LegalMoveEntry {
+                        candidate_move: direction.candidate_move,
+                        is_ejection,
+                        is_push,
+                        history_key: direction.history_key,
+                        plan_index: direction.plan_index,
+                        enemy_effect,
+                    });
+                }
             }
         }
     }

@@ -320,10 +320,10 @@ impl NnueModel {
         let liberties = i32::from(shape.black.liberty_count) - i32::from(shape.white.liberty_count);
         let liberties = if black_to_move { liberties } else { -liberties };
 
-        score = score.saturating_add(material.saturating_mul(4096 / remaining));
-        score = score.saturating_sub(center.saturating_mul(256 / remaining));
-        score = score.saturating_add(progress.saturating_mul(512 / remaining));
-        score = score.saturating_add(liberties.saturating_mul(256 / remaining));
+        score = score.saturating_add(material.saturating_mul(1024 / remaining));
+        score = score.saturating_sub(center.saturating_mul(64 / remaining));
+        score = score.saturating_add(progress.saturating_mul(128 / remaining));
+        score = score.saturating_add(liberties.saturating_mul(64 / remaining));
         score
     }
 }
@@ -507,23 +507,27 @@ fn side_feature_shape(bits: u64) -> SideFeatureShape {
     (shape.liberty_count, shape.singletons) = edge_span(bits);
     shape
 }
-fn edge_span(bits: u64) -> (u8, u8) {
-    let cells = geometry().cells();
-    let mut active = bits;
-    let mut liberty_mask = 0u64;
-    let mut singletons = 0u8;
-    while active != 0 {
-        let bit = active & active.wrapping_neg();
-        active ^= bit;
-        let neighbors = cells[bit.trailing_zeros() as usize].neighbor_mask;
-        liberty_mask |= neighbors & !bits;
-        if neighbors & bits == 0 {
-            singletons = singletons.saturating_add(1);
-        }
+const EDGE_NEIGHBOR_SHIFTS: [(u32, u64); 6] = [
+    (1, 0x0f7d_fbfb_fdfd_fbef),
+    (5, 0x00f8_0000_0000_001f),
+    (6, 0x007f_f000_0000_07ff),
+    (7, 0x0001_fff0_0003_ffe0),
+    (8, 0x0000_03ff_fbff_f800),
+    (9, 0x0000_0003_fffc_0000),
+];
+#[inline]
+fn edge_adjacent_mask(bits: u64) -> u64 {
+    let mut adjacent = 0u64;
+    for &(shift, lower_cells) in &EDGE_NEIGHBOR_SHIFTS {
+        adjacent |= ((bits & lower_cells) << shift) | ((bits >> shift) & lower_cells);
     }
+    adjacent
+}
+fn edge_span(bits: u64) -> (u8, u8) {
+    let adjacent = edge_adjacent_mask(bits);
     (
-        liberty_mask.count_ones().min(u8::MAX as u32) as u8,
-        singletons,
+        (adjacent & !bits).count_ones().min(u8::MAX as u32) as u8,
+        (bits & !adjacent).count_ones().min(u8::MAX as u32) as u8,
     )
 }
 pub(crate) fn update_side_feature_shape(
@@ -666,4 +670,58 @@ fn take_f32_box(bytes: &[u8], cursor: &mut usize, len: usize) -> Box<[f32]> {
         i += 1;
     }
     out.into_boxed_slice()
+}
+
+#[cfg(test)]
+mod edge_span_tests {
+    use super::*;
+
+    fn next_random(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut value = *state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^ (value >> 31)
+    }
+
+    fn reference_edge_span(bits: u64) -> (u8, u8) {
+        let cells = geometry().cells();
+        let mut active = bits;
+        let mut liberty_mask = 0u64;
+        let mut singletons = 0u8;
+        while active != 0 {
+            let bit = active & active.wrapping_neg();
+            active ^= bit;
+            let neighbors = cells[bit.trailing_zeros() as usize].neighbor_mask;
+            liberty_mask |= neighbors & !bits;
+            if neighbors & bits == 0 {
+                singletons += 1;
+            }
+        }
+        (liberty_mask.count_ones() as u8, singletons)
+    }
+
+    #[test]
+    fn shifted_neighbor_masks_are_an_exact_basis_and_edge_span_is_exact() {
+        for cell_index in 0..board::CELL_COUNT {
+            assert_eq!(
+                edge_adjacent_mask(1u64 << cell_index),
+                geometry().cells()[cell_index].neighbor_mask,
+                "neighbor basis mismatch at cell {cell_index}",
+            );
+        }
+        assert_eq!(
+            EDGE_NEIGHBOR_SHIFTS
+                .iter()
+                .map(|(_, lower_cells)| lower_cells.count_ones())
+                .sum::<u32>(),
+            156,
+        );
+
+        let mut random = 0xED6E_5A4A_B17B_04D5;
+        for _ in 0..1_000_000 {
+            let bits = next_random(&mut random) & board::BOARD_MASK;
+            assert_eq!(edge_span(bits), reference_edge_span(bits));
+        }
+    }
 }
