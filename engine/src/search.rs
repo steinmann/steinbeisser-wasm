@@ -24,7 +24,7 @@ const DEPTH_ADMISSION_MARGIN_MS: u64 = 4;
 const DEPTH_ADMISSION_MARGIN_MS: u64 = 1;
 const ABORT_POLL_MASK: u64 = 8191;
 const RAW_ABORT_POLL_MASK: u64 = 2047;
-const ROOT_REVERSE_MOVE_PENALTY: i32 = 200;
+const ROOT_REVERSE_MOVE_PENALTY: i32 = 50;
 const EMERGENCY_EJECTION_BONUS: i32 = 96;
 const ASPIRATION_WINDOW: i32 = 80;
 const LMR_MIN_DEPTH: u8 = 4;
@@ -33,8 +33,8 @@ const LMR_DEPTH_DIVISOR: u8 = 4;
 const LMR_MOVE_DIVISOR: usize = 12;
 const NULL_MOVE_REDUCTION: u8 = 3;
 const NULL_MOVE_MIN_DEPTH: u8 = 5;
-const FUTILITY_MARGIN_DEPTH1: i32 = 200;
-const FUTILITY_MARGIN_DEPTH2: i32 = 480;
+const FUTILITY_MARGIN_DEPTH1: i32 = 208;
+const FUTILITY_MARGIN_DEPTH2: i32 = 495;
 const USE_LATE_MOVE_PRUNING: bool = true;
 const EVAL_CACHE_WAYS: usize = 4;
 const COUNTERMOVE_TABLE_BITS: usize = 15;
@@ -79,7 +79,7 @@ fn search_config() -> &'static SearchConfig {
     static CFG: SearchConfig = SearchConfig {
         use_fast_movegen: true,
         use_transposition_backfill: false,
-        partial_sort_k: 6,
+        partial_sort_k: 8,
     };
     &CFG
 }
@@ -573,11 +573,16 @@ impl Searcher {
         transposition_table_size: usize,
     ) -> Self {
         let config = *search_config();
-        let shared = if !reset_shared {
+        let mut shared = if !reset_shared {
             take_persistent_context_with_tt_size(transposition_table_size)
         } else {
             PersistentContext::new_with_tt_size(transposition_table_size)
         };
+        for table in &mut shared.correction_history {
+            for score in table {
+                *score = (i32::from(*score) * 113 / 128) as i16;
+            }
+        }
         let mut history_scores = shared.history_scores;
         for table in &mut history_scores {
             for score in table {
@@ -1076,8 +1081,6 @@ impl Searcher {
             if alpha >= beta {
                 if is_quiet {
                     self.record_killer(0, candidate_move);
-                    self.reward_history(side, move_entry.plan_index, depth);
-                    self.record_countermove(side, None, move_entry.history_key);
                 }
                 self.store_root_transposition(TranspositionEntry {
                     key: root_key,
@@ -1172,8 +1175,6 @@ impl Searcher {
             if alpha >= beta {
                 if is_quiet {
                     self.record_killer(0, candidate_move);
-                    self.reward_history(side, move_entry.plan_index, depth);
-                    self.record_countermove(side, None, move_entry.history_key);
                 }
                 self.store_root_transposition(TranspositionEntry {
                     key: root_key,
