@@ -565,12 +565,12 @@ impl Geometry {
 #[derive(Clone, Copy)]
 pub struct Move {
     source_cells: [CellId; 3],
-    meta:std::num::NonZeroU8,
+    meta: std::num::NonZeroU8,
 }
 impl Move {
     pub const PLACEHOLDER: Self = Self {
         source_cells: [CellId::new_unchecked(0); 3],
-        meta:std::num::NonZeroU8::new(1).unwrap(),
+        meta: std::num::NonZeroU8::new(1).unwrap(),
     };
     pub fn new(mut source_cells: Vec<CellId>, direction: Direction) -> Result<Self, MoveError> {
         if source_cells.is_empty() {
@@ -595,7 +595,7 @@ impl Move {
         }
         Ok(Self {
             source_cells: packed_source_cells,
-            meta:std::num::NonZeroU8::new(len|((direction.index() as u8)<<2)).unwrap(),
+            meta: std::num::NonZeroU8::new(len | ((direction.index() as u8) << 2)).unwrap(),
         })
     }
     pub fn from_cells(source_cells: &[CellId], direction: Direction) -> Result<Self, MoveError> {
@@ -621,7 +621,7 @@ impl Move {
         }
         Ok(Self {
             source_cells: packed_source_cells,
-            meta:std::num::NonZeroU8::new(len|((direction.index() as u8)<<2)).unwrap(),
+            meta: std::num::NonZeroU8::new(len | ((direction.index() as u8) << 2)).unwrap(),
         })
     }
     pub fn new_unchecked(source_cells: &[CellId], direction: Direction) -> Self {
@@ -659,15 +659,17 @@ impl Move {
         }
         Self {
             source_cells: packed_source_cells,
-            meta:std::num::NonZeroU8::new(len|((direction.index() as u8)<<2)).unwrap(),
+            meta: std::num::NonZeroU8::new(len | ((direction.index() as u8) << 2)).unwrap(),
         }
     }
     pub fn source_cells(&self) -> &[CellId] {
-        &self.source_cells[..(self.meta.get()&3) as usize]
+        &self.source_cells[..(self.meta.get() & 3) as usize]
     }
-    pub fn direction(&self)->Direction {ALL_DIRECTIONS[(self.meta.get()>>2) as usize]}
+    pub fn direction(&self) -> Direction {
+        ALL_DIRECTIONS[(self.meta.get() >> 2) as usize]
+    }
     pub fn len(&self) -> usize {
-        (self.meta.get()&3) as usize
+        (self.meta.get() & 3) as usize
     }
     pub fn is_empty(&self) -> bool {
         false
@@ -679,7 +681,7 @@ impl Move {
             transformed_cells[index] = geometry.transform(cell, symmetry);
         }
         Self::from_cells(
-            &transformed_cells[..(self.meta.get()&3) as usize],
+            &transformed_cells[..(self.meta.get() & 3) as usize],
             geometry.transform_direction(self.direction(), symmetry),
         )
         .unwrap()
@@ -792,7 +794,10 @@ fn validate_contiguous_group(source_cells: &[CellId]) -> Result<(), MoveError> {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub struct Position {black:u64,white:u64}
+pub struct Position {
+    black: u64,
+    white: u64,
+}
 impl Position {
     pub const MAX_PIECES_PER_SIDE: usize = 14;
     pub fn new(
@@ -804,11 +809,34 @@ impl Position {
         let white = Self::bits_from_cells(Color::White, &mut white)?;
         Self::from_bitboards(side_to_move, black, white)
     }
-    pub fn from_bitboards(side_to_move:Color,black:u64,white:u64)->Result<Self,PositionError>{
-        let outside=(black|white)&!BOARD_MASK;if outside!=0{return Err(PositionError::CellsOutsideBoard(outside));}
-        let position=Self{black,white:white|if side_to_move==Color::White{1u64<<63}else{0}};position.validate()?;Ok(position)
+    pub fn from_bitboards(
+        side_to_move: Color,
+        black: u64,
+        white: u64,
+    ) -> Result<Self, PositionError> {
+        let outside = (black | white) & !BOARD_MASK;
+        if outside != 0 {
+            return Err(PositionError::CellsOutsideBoard(outside));
+        }
+        let position = Self {
+            black,
+            white: white
+                | if side_to_move == Color::White {
+                    1u64 << 63
+                } else {
+                    0
+                },
+        };
+        position.validate()?;
+        Ok(position)
     }
-    pub const fn side_to_move(&self)->Color {if self.white&(1u64<<63)==0 {Color::Black}else{Color::White}}
+    pub const fn side_to_move(&self) -> Color {
+        if self.white & (1u64 << 63) == 0 {
+            Color::Black
+        } else {
+            Color::White
+        }
+    }
     pub const fn black(&self) -> CellSet {
         CellSet::from_bits(self.black)
     }
@@ -818,7 +846,9 @@ impl Position {
     pub const fn black_bits(&self) -> u64 {
         self.black
     }
-    pub const fn white_bits(&self)->u64 {self.white&BOARD_MASK}
+    pub const fn white_bits(&self) -> u64 {
+        self.white & BOARD_MASK
+    }
     pub const fn occupied_bits(&self) -> u64 {
         self.black | self.white_bits()
     }
@@ -831,7 +861,14 @@ impl Position {
             Color::White => self.white_bits(),
         }
     }
-    pub(crate) fn set_side_to_move(&mut self,side_to_move:Color){self.white=self.white_bits()|if side_to_move==Color::White{1u64<<63}else{0};}
+    pub(crate) fn set_side_to_move(&mut self, side_to_move: Color) {
+        self.white = self.white_bits()
+            | if side_to_move == Color::White {
+                1u64 << 63
+            } else {
+                0
+            };
+    }
     pub(crate) fn apply_masks(
         &mut self,
         side: Color,
@@ -885,7 +922,18 @@ impl Position {
     pub const fn marble_count(&self, color: Color) -> usize {
         self.bits_for(color).count_ones() as usize
     }
-    pub fn transform(&self,symmetry:Symmetry)->Self {let g=geometry();let tx=|cells:CellSet|cells.into_iter().fold(0u64,|b,c|b|(1u64<<g.transform(c,symmetry).as_u8()));Self{black:tx(self.black()),white:tx(self.white())|(self.white&!BOARD_MASK)}}
+    pub fn transform(&self, symmetry: Symmetry) -> Self {
+        let g = geometry();
+        let tx = |cells: CellSet| {
+            cells
+                .into_iter()
+                .fold(0u64, |b, c| b | (1u64 << g.transform(c, symmetry).as_u8()))
+        };
+        Self {
+            black: tx(self.black()),
+            white: tx(self.white()) | (self.white & !BOARD_MASK),
+        }
+    }
     pub fn validate(&self) -> Result<(), PositionError> {
         let outside = (self.black | self.white_bits()) & !BOARD_MASK;
         if outside != 0 {
@@ -1109,14 +1157,29 @@ impl fmt::Display for PositionError {
     }
 }
 
+impl std::hash::Hash for Position {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.black.hash(h);
+        self.white_bits().hash(h);
+        self.side_to_move().hash(h);
+    }
+}
+impl std::fmt::Debug for Position {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Position")
+            .field("black", &self.black)
+            .field("white", &self.white_bits())
+            .field("side_to_move", &self.side_to_move())
+            .finish()
+    }
+}
 
-impl std::hash::Hash for Position {fn hash<H:std::hash::Hasher>(&self,h:&mut H){self.black.hash(h);self.white_bits().hash(h);self.side_to_move().hash(h);}}
-impl std::fmt::Debug for Position {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.debug_struct("Position").field("black",&self.black).field("white",&self.white_bits()).field("side_to_move",&self.side_to_move()).finish()}}
-
-impl fmt::Debug for Move {fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {f.debug_struct("Move").field("source_cells",&self.source_cells).field("len",&(self.len() as u8)).field("direction",&self.direction()).finish()}}
-
-pub(crate) fn round3_checks(){}
-
-pub(crate) fn round4_checks(){}
-
-pub(crate) fn round5_checks(){}
+impl fmt::Debug for Move {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Move")
+            .field("source_cells", &self.source_cells)
+            .field("len", &(self.len() as u8))
+            .field("direction", &self.direction())
+            .finish()
+    }
+}
