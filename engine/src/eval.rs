@@ -22,6 +22,7 @@ pub(crate) struct NnueAccumulator {
     white: [i32; SPARSE_FEATURE_COUNT],
 }
 pub(crate) struct NnueModel {
+    ternary_channels:[bool;8],
     sparse_scale: f32,
     dense_offsets: [f32; DENSE_FEATURE_COUNT],
     dense_scales: [f32; DENSE_FEATURE_COUNT],
@@ -29,13 +30,13 @@ pub(crate) struct NnueModel {
     act0: f32,
     act1: f32,
     baseline_accumulator: [i32; SPARSE_FEATURE_COUNT],
-    sparse_weights: Box<[i16]>,
-    dense_weights: Box<[f32]>,
+    sparse_weights: Box<[i16; NNUE_SPARSE * SPARSE_FEATURE_COUNT]>,
+    dense_weights: Box<[f32; DENSE_FEATURE_COUNT * SPARSE_FEATURE_COUNT]>,
     hidden_scale: f32,
     hidden_bias: [f32; NNUE_H1],
-    hidden_weights: Box<[i8]>,
+    hidden_weights: Box<[i8; NNUE_H0_PAD * NNUE_H1]>,
     output_scale: f32,
-    output_weights: Box<[i8]>,
+    output_weights: Box<[i8; NNUE_H1_PAD]>,
 }
 impl NnueModel {
     fn load() -> Self {
@@ -113,11 +114,13 @@ impl NnueModel {
             *slot = take_i32(&bytes, &mut cursor);
         }
         let sparse_weights = take_i16_box(&bytes, &mut cursor, NNUE_SPARSE * SPARSE_FEATURE_COUNT);
+        let sparse_weights:Box<[i16; NNUE_SPARSE * SPARSE_FEATURE_COUNT]>=sparse_weights.try_into().unwrap();
         let dense_weights = take_f32_box(
             &bytes,
             &mut cursor,
             DENSE_FEATURE_COUNT * SPARSE_FEATURE_COUNT,
         );
+        let dense_weights:Box<[f32; DENSE_FEATURE_COUNT * SPARSE_FEATURE_COUNT]>=dense_weights.try_into().unwrap();
         assert_eq!(take_u32(&bytes, &mut cursor) as usize, NNUE_H0_PAD);
         let hidden_scale = take_f32(&bytes, &mut cursor);
         let mut hidden_bias = [0.0; NNUE_H1];
@@ -125,11 +128,18 @@ impl NnueModel {
             *slot = take_f32(&bytes, &mut cursor);
         }
         let hidden_weights = take_i8_box(&bytes, &mut cursor, NNUE_H0_PAD * NNUE_H1);
+        let hidden_weights:Box<[i8; NNUE_H0_PAD * NNUE_H1]>=hidden_weights.try_into().unwrap();
         assert_eq!(take_u32(&bytes, &mut cursor) as usize, NNUE_H1_PAD);
         let output_scale = take_f32(&bytes, &mut cursor);
         let output_weights = take_i8_box(&bytes, &mut cursor, NNUE_H1_PAD);
+        let output_weights:Box<[i8; NNUE_H1_PAD]>=output_weights.try_into().unwrap();
         assert_eq!(cursor, bytes.len());
+        let ternary_channels=std::array::from_fn(|d| matches!(d,0|1|4|5)&&dense_offsets[d]==0.0&&dense_scales[d]==1.0&&dense_weights.iter().all(|x|x.is_finite()));
+        let mut paired=Box::new([0i16;NNUE_SPARSE*SPARSE_FEATURE_COUNT]);
+        for c in 0..61 {for f in 0..84 {paired[2*c*84+f]=sparse_weights[c*84+f];paired[(2*c+1)*84+f]=sparse_weights[(61+c)*84+f];}}
+        let sparse_weights=paired;
         Self {
+            ternary_channels,
             sparse_scale,
             dense_offsets,
             dense_scales,
@@ -168,16 +178,8 @@ impl NnueModel {
         delta: i32,
     ) {
         let raw = cell.as_usize();
-        let black_row = if color == Color::Black {
-            raw
-        } else {
-            board::CELL_COUNT + raw
-        };
-        let white_row = if color == Color::Black {
-            board::CELL_COUNT + raw
-        } else {
-            raw
-        };
+        let black_row=2*raw+usize::from(color!=Color::Black);
+        let white_row=black_row^1;
         let black_base = black_row * SPARSE_FEATURE_COUNT;
         let white_base = white_row * SPARSE_FEATURE_COUNT;
         #[cfg(target_arch = "aarch64")]
@@ -268,8 +270,10 @@ impl NnueModel {
                 let row_start = dense_index * SPARSE_FEATURE_COUNT;
                 let mut sparse_index = 0;
                 while sparse_index < SPARSE_FEATURE_COUNT {
-                    sparse_hidden[sparse_index] +=
-                        self.dense_weights[row_start + sparse_index] * feature_value;
+                    let w=self.dense_weights[row_start+sparse_index];
+                    if self.ternary_channels[dense_index] && feature_value==1.0 {sparse_hidden[sparse_index]+=w;}
+                    else if self.ternary_channels[dense_index] && feature_value == -1.0 {sparse_hidden[sparse_index]-=w;}
+                    else {sparse_hidden[sparse_index]+=w*feature_value;}
                     sparse_index += 1;
                 }
             }
@@ -297,10 +301,11 @@ impl NnueModel {
         let mut quantized_hidden = [0i8; NNUE_H1_PAD];
         hidden_index = 0;
         while hidden_index < NNUE_H1 {
-            quantized_hidden[hidden_index] = quantize_relu(hidden_values[hidden_index], self.act1);
+            quantized_hidden[hidden_index] = r4_quant_nonnegative(hidden_values[hidden_index], self.act1);
             hidden_index += 1;
         }
-        let dot = dot_i8_hidden(&quantized_hidden, &self.output_weights);
+        #[cfg(bench_audit)] bench_record(&sparse_hidden,&quantized_sparse,&hidden_values,&quantized_hidden);
+        let dot = dot_i8_hidden(&quantized_hidden, self.output_weights.as_ref());
         let nnue_score = ((dot as f32 * self.act1 * self.output_scale + self.output_bias)
             .clamp(-NNUE_MAX_OUT, NNUE_MAX_OUT)
             * NNUE_SCORE_LIMIT)
@@ -725,3 +730,21 @@ mod edge_span_tests {
         }
     }
 }
+
+#[cfg(bench_audit)] thread_local!{static BENCH_LAST:std::cell::Cell<u64>=const{std::cell::Cell::new(0)};}
+#[cfg(bench_audit)] fn bench_record(a:&[f32],b:&[i8],c:&[f32],d:&[i8]){use std::hash::{Hash,Hasher};let mut h=std::collections::hash_map::DefaultHasher::new();for v in a{v.to_bits().hash(&mut h);}b.hash(&mut h);for v in c{v.to_bits().hash(&mut h);}d.hash(&mut h);BENCH_LAST.with(|x|x.set(h.finish()));}
+#[cfg(bench_audit)] pub(crate) fn bench_last()->u64 {BENCH_LAST.with(|x|x.get())}
+#[cfg(bench_audit)] pub(crate) fn bench_check(a:&NnueAccumulator,p:&Position)->u64{use std::hash::{Hash,Hasher};let b=nnue().root_accumulator(p);assert_eq!(a.black,b.black);assert_eq!(a.white,b.white);let mut h=std::collections::hash_map::DefaultHasher::new();a.black.hash(&mut h);a.white.hash(&mut h);h.finish()}
+
+
+pub(crate) fn round3_checks(){}
+
+fn r4_quant_nonnegative(v: f32, scale: f32) -> i8 {
+    ((v / if scale > 0.0 { scale } else { 1.0 / 127.0 })
+        .round()
+        .clamp(0.0, 127.0)) as i8
+}
+
+pub(crate) fn round4_checks(){for scale in [0.0f32,-1.0,1.0/127.0,0.25,1.0,127.0,f32::INFINITY,f32::NAN,f32::from_bits(1)]{let mut x=3u32;for _ in 0..100000{x=x.wrapping_mul(1664525).wrapping_add(1013904223);let v=f32::from_bits(x).max(0.0);assert_eq!(quantize_relu(v,scale),r4_quant_nonnegative(v,if false {if scale>0.0{scale}else{1.0/127.0}}else{scale}));}}}
+
+pub(crate) fn round5_checks(){}
