@@ -4,7 +4,7 @@ use crate::game::{
     SessionState, apply_move_state, legal_moves_for_selection_state, search_best_move_state,
     search_best_move_with_limits_state, session_status_state, undo_full_turn_state,
 };
-use crate::movegen::PositionState;
+use crate::movegen::reverse_move;
 use crate::search::{MAX_GAME_TURNS, search_raw_with_turn};
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
@@ -28,6 +28,18 @@ where
 #[wasm_bindgen]
 pub fn new_session() -> Result<JsValue, JsValue> {
     to_js(&SessionState::new().to_dto())
+}
+
+#[wasm_bindgen]
+pub fn session_from_position(position: &str, turn_index: u16) -> Result<JsValue, JsValue> {
+    let session = crate::game::session_from_position_state(position, turn_index)
+        .map_err(|error| JsValue::from_str(&error))?;
+    to_js(&session.to_dto())
+}
+
+#[wasm_bindgen]
+pub fn max_marbles_per_side() -> usize {
+    Position::MAX_PIECES_PER_SIDE
 }
 
 #[wasm_bindgen]
@@ -85,78 +97,7 @@ pub fn session_status(session: JsValue) -> Result<JsValue, JsValue> {
     to_js(&session_status_state(&session))
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct GameResultDto {
-    pub kind: String,
-    pub winner: Option<String>,
-    pub reason: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct MoveStackEntryDto {
-    pub position: String,
-    pub history_positions: Vec<String>,
-    pub no_progress_ply: u16,
-    pub turn_index: u16,
-    pub last_engine_reverse_move: Option<String>,
-    pub last_move: Option<String>,
-    pub result: Option<GameResultDto>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionDto {
-    pub position: String,
-    pub side_to_move: String,
-    pub history_positions: Vec<String>,
-    pub no_progress_ply: u16,
-    pub turn_index: u16,
-    pub last_engine_reverse_move: Option<String>,
-    pub move_stack: Vec<MoveStackEntryDto>,
-    pub black_count: usize,
-    pub white_count: usize,
-    pub last_move: Option<String>,
-    pub result: Option<GameResultDto>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct MoveCandidateDto {
-    pub r#move: String,
-    pub source_cells: Vec<String>,
-    pub direction: String,
-    pub anchor_cell: String,
-    pub is_inline: bool,
-    pub is_broadside: bool,
-    pub is_push: bool,
-    pub is_ejection: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct SearchResultDto {
-    pub best_move: String,
-    pub score: i32,
-    pub depth: u8,
-    pub nodes: u64,
-    pub white_perspective_score: i32,
-    pub black_perspective_score: i32,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct StatusDto {
-    pub side_to_move: String,
-    pub black_count: usize,
-    pub white_count: usize,
-    pub turn_index: u16,
-    pub no_progress_ply: u16,
-    pub result: Option<GameResultDto>,
-    pub is_game_over: bool,
-    pub can_take_back: bool,
-}
+pub use crate::dto::*;
 
 const CODINGAME_FIRST_TURN_MS: u64 = 500;
 const CODINGAME_TURN_MS: u64 = 45;
@@ -198,7 +139,6 @@ struct CodingameState {
     own_color: Color,
     prior_positions: Vec<Position>,
     last_position: Option<Position>,
-    last_position_after_own_move: Option<Position>,
     last_total_score: Option<i32>,
     last_reverse_move: Option<Move>,
     no_progress_ply: u16,
@@ -211,7 +151,6 @@ impl CodingameState {
             own_color,
             prior_positions: Vec::new(),
             last_position: None,
-            last_position_after_own_move: None,
             last_total_score: None,
             last_reverse_move: None,
             no_progress_ply: 0,
@@ -220,7 +159,7 @@ impl CodingameState {
     }
 
     fn observe_position(&mut self, position: &Position, total_score: i32) {
-        if let Some(previous) = self.last_position.replace(position.clone()) {
+        if let Some(previous) = self.last_position.replace(*position) {
             self.prior_positions.push(previous);
             self.no_progress_ply = if self.last_total_score == Some(total_score) {
                 self.no_progress_ply.saturating_add(2)
@@ -251,9 +190,7 @@ impl CodingameState {
         self.own_turn_count = self.own_turn_count.saturating_add(1);
     }
 
-    fn record_own_move(&mut self, position: &Position, candidate_move: Option<Move>) {
-        self.last_position_after_own_move =
-            candidate_move.and_then(|candidate_move| position_after_move(position, candidate_move));
+    fn record_own_move(&mut self, candidate_move: Option<Move>) {
         self.last_reverse_move = candidate_move.and_then(reverse_move);
     }
 }
@@ -321,7 +258,7 @@ fn run_codingame_from_stdin() -> Result<(), String> {
 
         println!("{}", chosen.raw);
         io::stdout().flush().map_err(|_| String::new())?;
-        state.record_own_move(&position, chosen.candidate_move);
+        state.record_own_move(chosen.candidate_move);
         state.finish_turn();
     }
 
@@ -411,26 +348,6 @@ fn read_position(
     }
 
     Position::new(side_to_move, black, white).map_err(|_| String::new())
-}
-
-pub(crate) fn reverse_move(candidate_move: Move) -> Option<Move> {
-    let geometry = geometry();
-    let mut destination_cells = [candidate_move.source_cells()[0]; 3];
-    for (index, cell) in candidate_move.source_cells().iter().copied().enumerate() {
-        destination_cells[index] =
-            geometry.cell(cell).neighbors[candidate_move.direction().index()]?;
-    }
-    Move::from_cells(
-        &destination_cells[..candidate_move.len()],
-        candidate_move.direction().opposite(),
-    )
-    .ok()
-}
-
-fn position_after_move(position: &Position, candidate_move: Move) -> Option<Position> {
-    let mut state = PositionState::new(position.clone()).ok()?;
-    state.apply_move(&candidate_move).ok()?;
-    Some(state.position().clone())
 }
 
 fn cells_between(

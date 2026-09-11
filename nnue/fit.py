@@ -59,85 +59,26 @@ class FeatureSchema:
 
 
 def current_feature_schema() -> FeatureSchema:
-    return schema_from_rust_source(NNUE_DIR / "src/core.rs")
-
-
-def schema_from_rust_source(path: Path) -> FeatureSchema:
-    text = path.read_text(encoding="utf-8")
-    row_lengths = tuple(parse_rust_array(text, "FEATURE_SCHEMA_ROW_LENGTHS", int))
-    dense_names = tuple(parse_rust_array(text, "DENSE_FEATURE_NAMES", str))
-    dense_scales = tuple(parse_rust_array(text, "DENSE_FEATURE_SCALES", float, source=text))
-    name = parse_rust_string_const(text, "FEATURE_SET_NAME")
-    max_active = parse_rust_usize_const(text, "MAX_ACTIVE_FEATURES")
-    return FeatureSchema(
-        name=name,
-        row_lengths=row_lengths,
-        sparse_count=sum(row_lengths) * 2,
-        dense_count=len(dense_names),
-        max_active_features=max_active,
-        dense_feature_names=dense_names,
-        dense_feature_scales=dense_scales,
+    # Versioned machine-readable artifact; Rust tests compare it to feature-schema.
+    raw = read_json(NNUE_DIR / "feature-schema.json")
+    if not isinstance(raw, dict):
+        raise ValueError("missing feature-schema.json")
+    schema = FeatureSchema(
+        name=raw["name"], row_lengths=tuple(raw["row_lengths"]),
+        sparse_count=raw["sparse_feature_count"], dense_count=raw["dense_feature_count"],
+        max_active_features=raw["max_active_features"],
+        dense_feature_names=tuple(raw["dense_feature_names"]),
+        dense_feature_scales=tuple(raw["dense_feature_scales"]),
     )
-
-
-def parse_rust_string_const(text: str, name: str) -> str:
-    match = re.search(rf'pub const {name}: &str = "([^"]+)";', text)
-    if not match:
-        raise ValueError(f"missing Rust const {name}")
-    return match.group(1)
-
-
-def parse_rust_usize_const(text: str, name: str) -> int:
-    match = re.search(rf"pub const {name}: usize = ([^;]+);", text)
-    if not match:
-        raise ValueError(f"missing Rust const {name}")
-    expression = match.group(1).strip()
-    if re.fullmatch(r"[0-9_]+", expression):
-        return int(expression.replace("_", ""))
-    max_pieces = parse_engine_max_pieces()
-    expression = expression.replace("Position::MAX_PIECES_PER_SIDE", str(max_pieces))
-    if re.fullmatch(r"[0-9_ ]+\*[0-9_ ]+", expression):
-        left, right = expression.split("*", 1)
-        return int(left.replace("_", "").strip()) * int(right.replace("_", "").strip())
-    raise ValueError(f"unsupported Rust const expression for {name}: {match.group(1)}")
-
-
-def parse_engine_max_pieces() -> int:
-    text = (WORKSPACE / "engine/src/board.rs").read_text(encoding="utf-8")
-    match = re.search(r"pub const MAX_PIECES_PER_SIDE: usize = ([0-9_]+);", text)
-    if not match:
-        raise ValueError("missing Position::MAX_PIECES_PER_SIDE source constant")
-    return int(match.group(1).replace("_", ""))
-
-
-def parse_rust_array(text: str, name: str, item_type: type, source: str | None = None) -> list:
-    match = re.search(
-        rf"pub const {name}: \[[^]]+\] = \[(.*?)\];",
-        text,
-        flags=re.DOTALL,
-    )
-    if not match:
-        raise ValueError(f"missing Rust array const {name}")
-    body = re.sub(r"//.*", "", match.group(1))
-    values = [value.strip() for value in body.split(",") if value.strip()]
-    if item_type is str:
-        return [value.strip('"') for value in values]
-    if item_type is int:
-        return [int(value.replace("_", "")) for value in values]
-    if item_type is float:
-        return [parse_rust_float(value, source or text) for value in values]
-    raise TypeError(item_type)
-
-
-def parse_rust_float(value: str, source: str) -> float:
-    normalized = value.rstrip("f32").replace("_", "")
-    try:
-        return float(normalized)
-    except ValueError:
-        match = re.search(rf"pub const {re.escape(value)}: f32 = ([0-9_.]+);", source)
-        if not match:
-            raise
-        return float(match.group(1).replace("_", ""))
+    if (schema.cell_count != raw["cell_count"]
+            or schema.input_count != raw["input_count"]
+            or schema.sparse_count != schema.cell_count * 2
+            or len(schema.dense_feature_names) != schema.dense_count
+            or len(schema.dense_feature_scales) != schema.dense_count
+            or len(set(schema.dense_feature_names)) != schema.dense_count
+            or not all(math.isfinite(scale) and scale > 0 for scale in schema.dense_feature_scales)):
+        raise ValueError("inconsistent feature schema dimensions")
+    return schema
 
 
 def huber_loss(error: float, delta: float = 1.0) -> float:
@@ -2181,25 +2122,16 @@ def huber_loss_vector(errors):
 
 
 
-def required_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise SystemExit(f"{name} is required; run train or python3 nnue/train.py")
-    return value
-
-
-def env_int(name: str, default: int) -> int:
-    return int(os.environ.get(name, str(default)))
-
-
-def trainer_main(argv: list[str] | None = None) -> int:
-    if argv:
-        raise SystemExit("embedded trainer is env-driven; run train or python3 nnue/train.py")
-    ensure_jax_loaded()
-    if not JAX_AVAILABLE:
-        raise SystemExit("jax is required for the Steinbeisser training recipe")
-
-    config = TrainingConfig(
+def training_config_from_env(env: dict[str, str]) -> TrainingConfig:
+    """Compatibility boundary: parse settings once without mutating global state."""
+    def required_env(name):
+        value = env.get(name)
+        if not value:
+            raise ValueError(f"{name} is required")
+        return value
+    def env_int(name, default):
+        return int(env.get(name, str(default)))
+    return TrainingConfig(
         train_path=required_env("STEINBEISSER_NNUE_TRAIN_PATH"),
         val_path=required_env("STEINBEISSER_NNUE_VAL_PATH"),
         manifest_path=required_env("STEINBEISSER_NNUE_MANIFEST_PATH"),
@@ -2229,5 +2161,19 @@ def trainer_main(argv: list[str] | None = None) -> int:
         ema_decay=0.9999,
         nnue_cli=required_env("STEINBEISSER_NNUE_CLI"),
     )
+
+
+def trainer_main(argv: list[str] | None = None, *, config: TrainingConfig | None = None) -> int:
+    if argv:
+        if len(argv) != 2 or argv[0] != "--config":
+            raise SystemExit("usage: fit.py --config training-config.json")
+        config = TrainingConfig(**read_json(Path(argv[1])))
+    if config is None:
+        config = training_config_from_env(dict(os.environ))
     print(json.dumps(run_training(config), indent=2))
     return 0
+
+
+if __name__ == "__main__":
+    import sys
+    raise SystemExit(trainer_main(sys.argv[1:]))

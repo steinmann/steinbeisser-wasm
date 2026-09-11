@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crate::board;
-use crate::board::{Color, Position, geometry};
+use crate::board::{CELL_COUNT, Color, MAX_GAME_TURNS, Position, geometry};
 use std::sync::OnceLock;
 
 const NNUE_MODEL_A85: &str = include_str!("net.mlp");
@@ -12,7 +12,7 @@ const OFFSET_NNQ_VERSION: u16 = 7;
 const LEGACY_NNQ_VERSION: u16 = 4;
 const NNUE_SCORE_LIMIT: f32 = 5000.0;
 const NNUE_MAX_OUT: f32 = 1.0;
-const NNUE_SPARSE: usize = 122;
+const NNUE_SPARSE: usize = CELL_COUNT * 2;
 const DENSE_FEATURE_COUNT: usize = 8;
 const SPARSE_FEATURE_COUNT: usize = 84;
 const NNUE_H1: usize = 50;
@@ -145,10 +145,12 @@ impl NnueModel {
                 && dense_weights.iter().all(|x| x.is_finite())
         });
         let mut paired = Box::new([0i16; NNUE_SPARSE * SPARSE_FEATURE_COUNT]);
-        for c in 0..61 {
-            for f in 0..84 {
-                paired[2 * c * 84 + f] = sparse_weights[c * 84 + f];
-                paired[(2 * c + 1) * 84 + f] = sparse_weights[(61 + c) * 84 + f];
+        for c in 0..CELL_COUNT {
+            for f in 0..SPARSE_FEATURE_COUNT {
+                paired[2 * c * SPARSE_FEATURE_COUNT + f] =
+                    sparse_weights[c * SPARSE_FEATURE_COUNT + f];
+                paired[(2 * c + 1) * SPARSE_FEATURE_COUNT + f] =
+                    sparse_weights[(CELL_COUNT + c) * SPARSE_FEATURE_COUNT + f];
             }
         }
         let sparse_weights = paired;
@@ -250,8 +252,6 @@ impl NnueModel {
         &self,
         black_to_move: bool,
         shape: &FeatureShape,
-        black_bits: u64,
-        white_bits: u64,
         turn_index: f32,
         no_progress_ply: f32,
         accumulator: &NnueAccumulator,
@@ -259,8 +259,6 @@ impl NnueModel {
         let dense = dense_features(
             black_to_move,
             shape,
-            black_bits,
-            white_bits,
             turn_index,
             no_progress_ply,
             &self.dense_offsets,
@@ -329,8 +327,8 @@ impl NnueModel {
             .clamp(-NNUE_MAX_OUT, NNUE_MAX_OUT)
             * NNUE_SCORE_LIMIT)
             .round() as i32;
-        let turn = turn_index.clamp(0.0, 350.0) as i32;
-        let remaining = (350 - turn).max(1);
+        let turn = turn_index.clamp(0.0, MAX_GAME_TURNS as f32) as i32;
+        let remaining = (i32::from(MAX_GAME_TURNS) - turn).max(1);
         let mut score = nnue_score;
 
         let material = i32::from(shape.black.piece_count) - i32::from(shape.white.piece_count);
@@ -434,8 +432,6 @@ pub(crate) fn nnue() -> &'static NnueModel {
 fn dense_features(
     black_to_move: bool,
     shape: &FeatureShape,
-    black_bits: u64,
-    white_bits: u64,
     turn_index: f32,
     no_progress_ply: f32,
     dense_offsets: &[f32; DENSE_FEATURE_COUNT],
@@ -446,7 +442,6 @@ fn dense_features(
     } else {
         (shape.white, shape.black, -1.0)
     };
-    let _ = (black_bits, white_bits);
     let mut dense = [0.0; DENSE_FEATURE_COUNT];
     let mut raw = [0.0; DENSE_FEATURE_COUNT];
     if DENSE_FEATURE_COUNT > 0 {
@@ -476,7 +471,7 @@ fn dense_features(
         raw[6] = remaining_turn_feature(turn_index);
     }
     if DENSE_FEATURE_COUNT > 7 {
-        raw[7] = no_progress_ply.clamp(0.0, 350.0);
+        raw[7] = no_progress_ply.clamp(0.0, MAX_GAME_TURNS as f32);
     }
     let mut feature_index = 0;
     while feature_index < DENSE_FEATURE_COUNT {
@@ -489,8 +484,55 @@ fn dense_features(
     dense
 }
 fn remaining_turn_feature(turn_index: f32) -> f32 {
-    let clamped = turn_index.clamp(0.0, 350.0);
-    ((350.0 - clamped) / 350.0).clamp(0.0, 1.0)
+    let clamped = turn_index.clamp(0.0, MAX_GAME_TURNS as f32);
+    ((MAX_GAME_TURNS as f32 - clamped) / MAX_GAME_TURNS as f32).clamp(0.0, 1.0)
+}
+
+/// Offline comparison surface for the production feature and evaluation paths.
+#[cfg(feature = "diagnostics")]
+pub mod diagnostics {
+    use super::*;
+
+    pub struct EvaluationSnapshot {
+        pub dense: [f32; DENSE_FEATURE_COUNT],
+        pub dense_offsets: [f32; DENSE_FEATURE_COUNT],
+        pub dense_scales: [f32; DENSE_FEATURE_COUNT],
+        pub score: i32,
+    }
+
+    pub fn model_bytes() -> Vec<u8> {
+        decode_a85(NNUE_MODEL_A85)
+    }
+
+    pub fn evaluation_snapshot(
+        position: &Position,
+        turn: u16,
+        no_progress: u16,
+    ) -> EvaluationSnapshot {
+        let model = nnue();
+        let shape = build_feature_shape(position.black_bits(), position.white_bits());
+        let accumulator = model.root_accumulator(position);
+        let black = position.side_to_move() == Color::Black;
+        EvaluationSnapshot {
+            dense: dense_features(
+                black,
+                &shape,
+                f32::from(turn),
+                f32::from(no_progress),
+                &model.dense_offsets,
+                &model.dense_scales,
+            ),
+            dense_offsets: model.dense_offsets,
+            dense_scales: model.dense_scales,
+            score: model.evaluate_with_accumulator_bits(
+                black,
+                &shape,
+                f32::from(turn),
+                f32::from(no_progress),
+                &accumulator,
+            ),
+        }
+    }
 }
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SideFeatureShape {

@@ -10,6 +10,9 @@ use serde_json::{Value, json};
 use super::*;
 use crate::sample::{self, BinarySample};
 
+#[path = "corpus_checkpoint.rs"]
+mod checkpoint;
+
 const SPLIT_SHARD_SAMPLES: usize = 50_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -202,14 +205,48 @@ fn build_corpus(args: &CorpusBuildArgs) -> Result<CorpusBuildReport> {
     let accepted_path = data_dir.join("accepted.sbin");
     let seen_path = data_dir.join("seen_keys.txt");
     let shard_state_path = data_dir.join("shards-v2.json");
-    let mut signatures = load_shard_signatures(&shard_state_path)?;
+    let checkpoint_path = data_dir.join("checkpoint-v1.json");
+    let committed = checkpoint::recover(&checkpoint_path, &accepted_path, &seen_path)?;
+    let mut signatures = match committed {
+        Some(signatures) => signatures,
+        None => {
+            // Validate old corpora before establishing their initial transaction.
+            // Do not guess how to repair an already inconsistent legacy corpus.
+            if accepted_path.exists() {
+                sample::sample_count(&accepted_path)?;
+                let records = sample::read_samples(&accepted_path)?;
+                let keys = records
+                    .iter()
+                    .map(BinarySample::key)
+                    .collect::<HashSet<_>>();
+                if keys.len() != records.len() || keys != load_seen_keys(&seen_path)? {
+                    bail!(
+                        "legacy corpus record/index mismatch; preserve it and rebuild into a fresh work directory"
+                    );
+                }
+            } else if seen_path.exists() || shard_state_path.exists() {
+                bail!("legacy corpus is missing accepted records");
+            }
+            load_shard_signatures(&shard_state_path)?
+        }
+    };
     let mut seen = load_seen_keys(&seen_path)?;
     if signatures_invalidated(&args.shards_dir, &signatures)? {
         signatures.clear();
         seen.clear();
-        remove_if_exists(&accepted_path)?;
-        remove_if_exists(&seen_path)?;
-        remove_if_exists(&shard_state_path)?;
+        // Move the complete old transaction together. Deleting records and
+        // then their checkpoint one at a time leaves an unrecoverable committed
+        // prefix if interrupted between removals. Keep the old corpus for audit.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let backup = args
+            .work_dir
+            .join(format!("corpus-data-invalidated-{stamp}"));
+        fs::rename(&data_dir, backup)?;
+        #[cfg(unix)]
+        fs::File::open(&args.work_dir)?.sync_all()?;
+        fs::create_dir(&data_dir)?;
     }
 
     let accepted_exists = accepted_path.is_file();
@@ -228,6 +265,11 @@ fn build_corpus(args: &CorpusBuildArgs) -> Result<CorpusBuildReport> {
             .append(true)
             .open(&seen_path)?,
     );
+    accepted_writer.flush()?;
+    seen_writer.flush()?;
+    accepted_writer.get_ref().sync_all()?;
+    seen_writer.get_ref().sync_all()?;
+    checkpoint::commit(&checkpoint_path, &accepted_path, &seen_path, &signatures)?;
     scan_shards(
         args,
         &mut signatures,
@@ -237,6 +279,9 @@ fn build_corpus(args: &CorpusBuildArgs) -> Result<CorpusBuildReport> {
     )?;
     accepted_writer.flush()?;
     seen_writer.flush()?;
+    accepted_writer.get_ref().sync_all()?;
+    seen_writer.get_ref().sync_all()?;
+    checkpoint::commit(&checkpoint_path, &accepted_path, &seen_path, &signatures)?;
     write_json(&shard_state_path, &signatures)?;
 
     let samples = load_accepted_prefix(&accepted_path, args.max_samples)?;
@@ -744,4 +789,177 @@ fn high_abs_score_record(sample: &BinarySample, max_abs_score: i32) -> bool {
         return false;
     }
     (sample.clipped_score as i32).abs() > max_abs_score
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixture {
+        root: PathBuf,
+        args: CorpusBuildArgs,
+    }
+
+    impl Fixture {
+        fn new() -> Result<Self> {
+            let root = std::env::temp_dir().join(format!(
+                "steinbeisser-corpus-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos()
+            ));
+            let args = CorpusBuildArgs {
+                shards_dir: root.join("shards"),
+                work_dir: root.join("work"),
+                cycle: 1,
+                max_samples: None,
+                validation_samples: 1,
+                max_abs_score: 3_500,
+                feature_set: FEATURE_SET_NAME.to_owned(),
+                input_count: INPUT_COUNT,
+                max_active_features: MAX_ACTIVE_FEATURES,
+            };
+            fs::create_dir_all(&args.shards_dir)?;
+            Ok(Self { root, args })
+        }
+
+        fn shard(&self, name: &str, plies: std::ops::Range<u16>) -> Result<()> {
+            let records = plies
+                .map(|ply| BinarySample {
+                    black_bits: 1,
+                    white_bits: 1 << 60,
+                    side_to_move_is_black: true,
+                    ply: f32::from(ply),
+                    no_progress_plies: 0.,
+                    score: 100.,
+                    clipped_score: 100.,
+                    result: 0.,
+                    result_bucket: 0,
+                    completed_depth: 2.,
+                    nodes: 10,
+                    elapsed_ms: 1,
+                    caused_ejection: false,
+                    occurrence_count: 1,
+                    sample_weight: 1.,
+                })
+                .collect::<Vec<_>>();
+            sample::write_samples(&self.args.shards_dir.join(name), &records)?;
+            Ok(())
+        }
+
+        fn data(&self, name: &str) -> PathBuf {
+            self.args.work_dir.join("corpus-data").join(name)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn increasing_sample_cap_resumes_partial_shard_without_duplicates() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        fixture.shard("000.sbin", 0..4)?;
+        fixture.args.max_samples = Some(2);
+        assert_eq!(build_corpus(&fixture.args)?.samples, 2);
+        let validation_keys = fs::read(fixture.args.work_dir.join("validation_keys.json"))?;
+        fixture.args.max_samples = Some(4);
+        fixture.args.cycle = 2;
+        let report = build_corpus(&fixture.args)?;
+        assert_eq!(report.samples, 4);
+        assert_eq!(report.train_samples, Some(3));
+        assert_eq!(report.val_samples, Some(1));
+        assert_eq!(sample::sample_count(&fixture.data("accepted.sbin"))?, 4);
+        assert_eq!(load_seen_keys(&fixture.data("seen_keys.txt"))?.len(), 4);
+        assert_eq!(
+            fs::read(fixture.args.work_dir.join("validation_keys.json"))?,
+            validation_keys
+        );
+        assert_eq!(build_corpus(&fixture.args)?.samples, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_scan_rolls_back_data_and_keys_before_retry() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.shard("000.sbin", 0..2)?;
+        assert_eq!(build_corpus(&fixture.args)?.samples, 2);
+        let checkpoint = fs::read(fixture.data("checkpoint-v1.json"))?;
+        fixture.shard("001.sbin", 2..4)?;
+        fs::write(
+            fixture.args.shards_dir.join("002.sbin"),
+            b"SBSMP01\npartial",
+        )?;
+        assert!(build_corpus(&fixture.args).is_err());
+        assert_eq!(fs::read(fixture.data("checkpoint-v1.json"))?, checkpoint);
+        fixture.shard("002.sbin", 4..6)?;
+        assert_eq!(build_corpus(&fixture.args)?.samples, 6);
+        let keys = sample::read_samples(&fixture.data("accepted.sbin"))?
+            .iter()
+            .map(BinarySample::key)
+            .collect::<HashSet<_>>();
+        assert_eq!(keys.len(), 6);
+        assert_eq!(keys, load_seen_keys(&fixture.data("seen_keys.txt"))?);
+        let tails = fs::read_dir(fixture.data(""))?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                path.extension()?
+                    .to_str()?
+                    .starts_with("uncommitted-")
+                    .then_some(path)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tails.len(),
+            2,
+            "both uncommitted append tails are preserved"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_invalidation_preserves_the_previous_complete_transaction() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.shard("000.sbin", 0..2)?;
+        assert_eq!(build_corpus(&fixture.args)?.samples, 2);
+        let old_records = fs::read(fixture.data("accepted.sbin"))?;
+        let old_checkpoint = fs::read(fixture.data("checkpoint-v1.json"))?;
+        fixture.shard("000.sbin", 10..13)?;
+        assert_eq!(build_corpus(&fixture.args)?.samples, 3);
+        let backups = fs::read_dir(&fixture.args.work_dir)?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                path.file_name()?
+                    .to_str()?
+                    .starts_with("corpus-data-invalidated-")
+                    .then_some(path)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(backups[0].join("accepted.sbin"))?, old_records);
+        assert_eq!(
+            fs::read(backups[0].join("checkpoint-v1.json"))?,
+            old_checkpoint
+        );
+        assert_eq!(build_corpus(&fixture.args)?.samples, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn inconsistent_legacy_corpus_is_preserved_not_reindexed() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.shard("000.sbin", 0..2)?;
+        assert_eq!(build_corpus(&fixture.args)?.samples, 2);
+        fs::remove_file(fixture.data("checkpoint-v1.json"))?;
+        fs::write(fixture.data("seen_keys.txt"), b"unrelated-key\n")?;
+        let records = fs::read(fixture.data("accepted.sbin"))?;
+        assert!(build_corpus(&fixture.args).is_err());
+        assert_eq!(fs::read(fixture.data("accepted.sbin"))?, records);
+        assert_eq!(fs::read(fixture.data("seen_keys.txt"))?, b"unrelated-key\n");
+        assert!(!fixture.data("checkpoint-v1.json").exists());
+        Ok(())
+    }
 }

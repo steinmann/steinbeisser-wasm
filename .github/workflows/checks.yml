@@ -1,0 +1,39 @@
+name: Checks
+on:
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Rust format, tests and lints
+        run: |
+          for crate in engine nnue; do
+            cargo fmt --manifest-path "$crate/Cargo.toml" --check
+            cargo test --manifest-path "$crate/Cargo.toml" --locked
+            cargo clippy --manifest-path "$crate/Cargo.toml" --all-targets --locked -- -D warnings
+          done
+      - name: Web and training interface tests
+        run: |
+          python3 -m pip install numpy==2.3.5
+          node --test tests/*.test.js
+          python3 -m unittest discover -s tests -p 'test_*.py'
+      - name: WASM bundle and interface smoke
+        run: |
+          cargo install wasm-bindgen-cli --locked --version "$(python3 scripts/build_manifest.py --bindgen-version)"
+          ./scripts/build.sh
+          STEINBEISSER_WASM_DIR=dist/pkg node --test tests/wasm.test.js

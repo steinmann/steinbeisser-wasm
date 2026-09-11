@@ -1,4 +1,6 @@
 engine/target/
+.build/
+__pycache__/
 nnue/target/
 nnue/**/target/
 nnue/**/*.pyc

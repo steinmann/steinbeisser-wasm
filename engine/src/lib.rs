@@ -1,7 +1,8 @@
-#![allow(dead_code, hidden_glob_reexports, private_interfaces)]
+#![warn(unsafe_op_in_unsafe_fn)]
 
 pub mod api;
 mod board;
+pub mod dto;
 mod eval;
 pub mod game;
 mod movegen;
@@ -14,4 +15,7 @@ pub use api::{
 };
 pub use board::*;
 pub use movegen::{MoveApplicationError, PositionState, UndoSnapshot};
-pub use search::{MAX_GAME_TURNS, SearchResult};
+pub use search::SearchResult;
+
+#[cfg(feature = "diagnostics")]
+pub use eval::diagnostics;

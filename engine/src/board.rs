@@ -563,6 +563,9 @@ impl Geometry {
 }
 
 #[derive(Clone, Copy)]
+/// Four-byte representation: three cell IDs plus a nonzero metadata byte.
+/// Metadata bits 0..=1 contain length (1..=3), bits 2..=4 contain direction.
+/// Keeping metadata nonzero gives Option<Move> the same four-byte layout.
 pub struct Move {
     source_cells: [CellId; 3],
     meta: std::num::NonZeroU8,
@@ -572,31 +575,8 @@ impl Move {
         source_cells: [CellId::new_unchecked(0); 3],
         meta: std::num::NonZeroU8::new(1).unwrap(),
     };
-    pub fn new(mut source_cells: Vec<CellId>, direction: Direction) -> Result<Self, MoveError> {
-        if source_cells.is_empty() {
-            return Err(MoveError::EmptySourceGroup);
-        }
-        if source_cells.len() > 3 {
-            return Err(MoveError::TooManySourceCells(source_cells.len()));
-        }
-        source_cells.sort_unstable();
-        for pair in source_cells.windows(2) {
-            if pair[0] == pair[1] {
-                return Err(MoveError::DuplicateSourceCell(pair[0].coord()));
-            }
-        }
-        if source_cells.len() > 1 {
-            validate_contiguous_group(&source_cells)?;
-        }
-        let len = source_cells.len() as u8;
-        let mut packed_source_cells = [source_cells[0]; 3];
-        for (index, cell) in source_cells.into_iter().enumerate() {
-            packed_source_cells[index] = cell;
-        }
-        Ok(Self {
-            source_cells: packed_source_cells,
-            meta: std::num::NonZeroU8::new(len | ((direction.index() as u8) << 2)).unwrap(),
-        })
+    pub fn new(source_cells: Vec<CellId>, direction: Direction) -> Result<Self, MoveError> {
+        Self::from_cells(&source_cells, direction)
     }
     pub fn from_cells(source_cells: &[CellId], direction: Direction) -> Result<Self, MoveError> {
         if source_cells.is_empty() {
@@ -795,9 +775,13 @@ fn validate_contiguous_group(source_cells: &[CellId]) -> Result<(), MoveError> {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Position {
+    // Cells occupy bits 0..CELL_COUNT (61); white's bit 63 stores side-to-move.
+    // Public bitboard accessors mask metadata out. Keep this two-u64 layout.
     black: u64,
     white: u64,
 }
+pub const MAX_GAME_TURNS: u16 = 350;
+
 impl Position {
     pub const MAX_PIECES_PER_SIDE: usize = 14;
     pub fn new(
@@ -1102,7 +1086,7 @@ impl fmt::Display for Position {
 impl FromStr for Position {
     type Err = PositionError;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let tokens = value.trim().split_whitespace().collect::<Vec<_>>();
+        let tokens = value.split_whitespace().collect::<Vec<_>>();
         let board = tokens.first().ok_or(PositionError::MissingFenBoard)?;
         let side_to_move = tokens
             .get(3)

@@ -1,0 +1,11 @@
+{
+  "name": "steinbeisser_nnue_features",
+  "row_lengths": [5, 6, 7, 8, 9, 8, 7, 6, 5],
+  "cell_count": 61,
+  "sparse_feature_count": 122,
+  "dense_feature_count": 8,
+  "input_count": 130,
+  "max_active_features": 28,
+  "dense_feature_names": ["edge_balance_norm", "compact_balance_norm", "reserved_group_slot_norm", "reserved_largest_group_slot_norm", "liberty_balance_norm", "isolated_balance_norm", "turns_to_limit_norm", "no_progress_plies_norm"],
+  "dense_feature_scales": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 64.0]
+}

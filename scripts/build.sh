@@ -3,18 +3,22 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORKSPACE_DIR="$(cd "${ROOT_DIR}/.." && pwd)"
 ENGINE_DIR="${ROOT_DIR}/engine"
 WEB_DIR="${ROOT_DIR}/web"
 DIST_DIR="${ROOT_DIR}/dist"
 PKG_DIR="${DIST_DIR}/pkg"
 WASM_NAME="steinbeisser"
-BUILD_ID="$(date -u +%Y%m%d%H%M%S)"
+cd "${ROOT_DIR}"
+BINDGEN_VERSION="$(python3 "${ROOT_DIR}/scripts/build_manifest.py" --bindgen-version)"
+if [[ "$(wasm-bindgen --version)" != "wasm-bindgen ${BINDGEN_VERSION}" ]]; then
+  echo "Install wasm-bindgen-cli ${BINDGEN_VERSION} to match engine/Cargo.lock" >&2
+  exit 1
+fi
 
 if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
   TARGET_DIR="${CARGO_TARGET_DIR}"
 else
-  TARGET_DIR="${WORKSPACE_DIR}/.build/steinbeisser-wasm"
+  TARGET_DIR="${ROOT_DIR}/.build/cargo-target"
 fi
 
 if [[ "${TARGET_DIR}" != /* ]]; then
@@ -25,6 +29,7 @@ cargo build \
   --manifest-path "${ENGINE_DIR}/Cargo.toml" \
   --target-dir "${TARGET_DIR}" \
   --release \
+  --locked \
   --target wasm32-unknown-unknown
 
 rm -rf "${DIST_DIR}"
@@ -36,6 +41,7 @@ wasm-bindgen \
   "${TARGET_DIR}/wasm32-unknown-unknown/release/${WASM_NAME}.wasm"
 
 cp -R "${WEB_DIR}/." "${DIST_DIR}/"
+BUILD_ID="$(python3 "${ROOT_DIR}/scripts/build_manifest.py" "${DIST_DIR}/build-manifest.json")"
 python3 - <<'PY' "${DIST_DIR}/index.html" "${BUILD_ID}"
 from pathlib import Path
 import sys

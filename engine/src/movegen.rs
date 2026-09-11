@@ -1,3 +1,10 @@
+#[path = "move_tables.rs"]
+mod tables;
+pub(crate) use tables::{
+    FastGroupDirection, FastSourceGroup, LegalMoveEntry, fast_movegen_tables, history_group_key,
+    move_front_cell, move_group_axis, move_is_inline, neighbor_cell,
+};
+
 use crate::board::{
     ALL_DIRECTIONS, Color, Direction, EngineStateView, LineAxis, Move, MoveError, Position,
     PositionError, geometry,
@@ -10,6 +17,67 @@ pub struct UndoSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PositionState {
     position: Position,
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn specialized_dispatch_matches_slow_legality_and_undo() {
+        let starts = [
+            include_str!("../../data/positions/classical.fen"),
+            include_str!("../../data/positions/belgian-daisy.fen"),
+            include_str!("../../data/positions/german-daisy.fen"),
+        ];
+        let mut state = PositionState::new(Position::from_str(starts[0]).unwrap()).unwrap();
+        let mut random = 0x5eed_u64;
+        for index in 0..1_000 {
+            if index % 100 == 0 {
+                state = PositionState::new(
+                    Position::from_str(starts[(index / 100) % starts.len()]).unwrap(),
+                )
+                .unwrap();
+            }
+            let slow = state.generate_legal_moves();
+            let mut fast = Vec::new();
+            state.generate_fast_legal_moves(&mut fast);
+            let mut fast_moves = fast
+                .iter()
+                .map(|entry| entry.candidate_move)
+                .collect::<Vec<_>>();
+            fast_moves.sort_unstable();
+            assert_eq!(fast_moves, slow);
+            let mut pushes = Vec::new();
+            state.generate_fast_push_moves(&mut pushes);
+            assert_eq!(
+                pushes,
+                fast.iter()
+                    .copied()
+                    .filter(|entry| entry.is_push)
+                    .collect::<Vec<_>>()
+            );
+            for entry in &fast {
+                let plan = state.analyze_move(&entry.candidate_move).unwrap();
+                assert_eq!(entry.is_push, plan.is_push());
+                assert_eq!(entry.is_ejection, plan.is_ejection());
+                assert_ne!(entry.history_key, u32::MAX);
+            }
+            if slow.is_empty() {
+                continue;
+            }
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let selected = slow[(random >> 32) as usize % slow.len()];
+            let before = *state.position();
+            let undo = state.apply_move(&selected).unwrap();
+            let after = *state.position();
+            state.undo_move(undo);
+            assert_eq!(*state.position(), before);
+            state.apply_move(&selected).unwrap();
+            assert_eq!(*state.position(), after);
+        }
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MoveApplicationError {
@@ -90,103 +158,29 @@ impl PositionState {
         }
         moves.into_iter().collect()
     }
-    pub(crate) fn generate_fast_legal_moves(&self, moves: &mut Vec<crate::search::LegalMoveEntry>) {
-        let side_bits = self.side_bits(self.position.side_to_move());
-        let enemy_bits = self.side_bits(self.position.side_to_move().other());
-        let occupied_bits = side_bits | enemy_bits;
-        let tables = crate::search::fast_movegen_tables();
-        moves.clear();
-        moves.reserve(tables.plan_count());
-        let dst = moves.as_mut_ptr();
-        let mut written = 0usize;
-        let candidate_group_bits = tables.owned_groups.generate(side_bits);
-        for (word_index, mut groups) in candidate_group_bits.into_iter().enumerate() {
-            while groups != 0 {
-                let bit_index = groups.trailing_zeros() as usize;
-                groups &= groups - 1;
-                let id = word_index * 64 + bit_index;
-                let mask = tables.source_masks[id];
-                if side_bits & mask != mask {
-                    continue;
-                }
-                let group = &tables.source_groups[id];
-                match (group.len, group.axis) {
-                    (1, 3) => self.emit_group::<1, 3, false>(
-                        group,
-                        side_bits,
-                        enemy_bits,
-                        occupied_bits,
-                        dst,
-                        &mut written,
-                    ),
-                    (2, 0) => self.emit_group::<2, 0, false>(
-                        group,
-                        side_bits,
-                        enemy_bits,
-                        occupied_bits,
-                        dst,
-                        &mut written,
-                    ),
-                    (2, 1) => self.emit_group::<2, 1, false>(
-                        group,
-                        side_bits,
-                        enemy_bits,
-                        occupied_bits,
-                        dst,
-                        &mut written,
-                    ),
-                    (2, 2) => self.emit_group::<2, 2, false>(
-                        group,
-                        side_bits,
-                        enemy_bits,
-                        occupied_bits,
-                        dst,
-                        &mut written,
-                    ),
-                    (3, 0) => self.emit_group::<3, 0, false>(
-                        group,
-                        side_bits,
-                        enemy_bits,
-                        occupied_bits,
-                        dst,
-                        &mut written,
-                    ),
-                    (3, 1) => self.emit_group::<3, 1, false>(
-                        group,
-                        side_bits,
-                        enemy_bits,
-                        occupied_bits,
-                        dst,
-                        &mut written,
-                    ),
-                    (3, 2) => self.emit_group::<3, 2, false>(
-                        group,
-                        side_bits,
-                        enemy_bits,
-                        occupied_bits,
-                        dst,
-                        &mut written,
-                    ),
-                    _ => unreachable!(),
-                }
-            }
-        }
-        // SAFETY: capacity >= every geometric plan; each unique plan is emitted at most once.
-        // Every slot below written was initialized by the immediately preceding writes.
-        unsafe {
-            moves.set_len(written);
-        }
+    pub(crate) fn generate_fast_legal_moves(&self, moves: &mut Vec<LegalMoveEntry>) {
+        self.generate_fast_moves::<false>(moves);
     }
-    pub(crate) fn generate_fast_push_moves(&self, moves: &mut Vec<crate::search::LegalMoveEntry>) {
+    pub(crate) fn generate_fast_push_moves(&self, moves: &mut Vec<LegalMoveEntry>) {
+        self.generate_fast_moves::<true>(moves);
+    }
+    // The two entry points share the dispatch rules, but remain separate native
+    // monomorphizations. PUSH is resolved at compile time, not per emitted move.
+    #[inline(always)]
+    fn generate_fast_moves<const PUSH: bool>(&self, moves: &mut Vec<LegalMoveEntry>) {
         let side_bits = self.side_bits(self.position.side_to_move());
         let enemy_bits = self.side_bits(self.position.side_to_move().other());
         let occupied_bits = side_bits | enemy_bits;
-        let tables = crate::search::fast_movegen_tables();
+        let tables = fast_movegen_tables();
         moves.clear();
         moves.reserve(tables.plan_count());
         let dst = moves.as_mut_ptr();
         let mut written = 0usize;
-        let candidate_group_bits = tables.owned_groups.generate_push(side_bits, enemy_bits);
+        let candidate_group_bits = if PUSH {
+            tables.owned_groups.generate_push(side_bits, enemy_bits)
+        } else {
+            tables.owned_groups.generate(side_bits)
+        };
         for (word_index, mut groups) in candidate_group_bits.into_iter().enumerate() {
             while groups != 0 {
                 let bit_index = groups.trailing_zeros() as usize;
@@ -197,67 +191,71 @@ impl PositionState {
                     continue;
                 }
                 let group = &tables.source_groups[id];
-                if group.len < 2 {
+                if PUSH && group.len < 2 {
                     continue;
                 }
-                match (group.len, group.axis) {
-                    (1, 3) => self.emit_group::<1, 3, true>(
-                        group,
-                        side_bits,
-                        enemy_bits,
-                        occupied_bits,
-                        dst,
-                        &mut written,
-                    ),
-                    (2, 0) => self.emit_group::<2, 0, true>(
-                        group,
-                        side_bits,
-                        enemy_bits,
-                        occupied_bits,
-                        dst,
-                        &mut written,
-                    ),
-                    (2, 1) => self.emit_group::<2, 1, true>(
-                        group,
-                        side_bits,
-                        enemy_bits,
-                        occupied_bits,
-                        dst,
-                        &mut written,
-                    ),
-                    (2, 2) => self.emit_group::<2, 2, true>(
-                        group,
-                        side_bits,
-                        enemy_bits,
-                        occupied_bits,
-                        dst,
-                        &mut written,
-                    ),
-                    (3, 0) => self.emit_group::<3, 0, true>(
-                        group,
-                        side_bits,
-                        enemy_bits,
-                        occupied_bits,
-                        dst,
-                        &mut written,
-                    ),
-                    (3, 1) => self.emit_group::<3, 1, true>(
-                        group,
-                        side_bits,
-                        enemy_bits,
-                        occupied_bits,
-                        dst,
-                        &mut written,
-                    ),
-                    (3, 2) => self.emit_group::<3, 2, true>(
-                        group,
-                        side_bits,
-                        enemy_bits,
-                        occupied_bits,
-                        dst,
-                        &mut written,
-                    ),
-                    _ => unreachable!(),
+                // SAFETY: reserve covers every unique geometric plan; each group
+                // is visited once and emits at most its six directions.
+                unsafe {
+                    match (group.len, group.axis) {
+                        (1, 3) => self.emit_group::<1, 3, PUSH>(
+                            group,
+                            side_bits,
+                            enemy_bits,
+                            occupied_bits,
+                            dst,
+                            &mut written,
+                        ),
+                        (2, 0) => self.emit_group::<2, 0, PUSH>(
+                            group,
+                            side_bits,
+                            enemy_bits,
+                            occupied_bits,
+                            dst,
+                            &mut written,
+                        ),
+                        (2, 1) => self.emit_group::<2, 1, PUSH>(
+                            group,
+                            side_bits,
+                            enemy_bits,
+                            occupied_bits,
+                            dst,
+                            &mut written,
+                        ),
+                        (2, 2) => self.emit_group::<2, 2, PUSH>(
+                            group,
+                            side_bits,
+                            enemy_bits,
+                            occupied_bits,
+                            dst,
+                            &mut written,
+                        ),
+                        (3, 0) => self.emit_group::<3, 0, PUSH>(
+                            group,
+                            side_bits,
+                            enemy_bits,
+                            occupied_bits,
+                            dst,
+                            &mut written,
+                        ),
+                        (3, 1) => self.emit_group::<3, 1, PUSH>(
+                            group,
+                            side_bits,
+                            enemy_bits,
+                            occupied_bits,
+                            dst,
+                            &mut written,
+                        ),
+                        (3, 2) => self.emit_group::<3, 2, PUSH>(
+                            group,
+                            side_bits,
+                            enemy_bits,
+                            occupied_bits,
+                            dst,
+                            &mut written,
+                        ),
+                        _ => unreachable!(),
+                    }
                 }
             }
         }
@@ -268,42 +266,59 @@ impl PositionState {
         }
     }
     #[inline(always)]
-    fn emit_group<const N: usize, const AX: usize, const PUSH: bool>(
+    // SAFETY: dst points into the reserved output buffer; written slots are
+    // initialized, with a slot available for each Some direction in g. N/AX match g.
+    unsafe fn emit_group<const N: usize, const AX: usize, const PUSH: bool>(
         &self,
-        g: &crate::search::FastSourceGroup,
+        g: &FastSourceGroup,
         own: u64,
         enemy: u64,
         occ: u64,
-        dst: *mut crate::search::LegalMoveEntry,
+        dst: *mut LegalMoveEntry,
         written: &mut usize,
     ) {
-        let group_dst = unsafe { dst.add(*written) };
-        let n0 =
-            self.emit_direction::<N, AX, PUSH, 0>(g, own, enemy, occ, unsafe { group_dst.add(0) });
-        let n1 =
-            self.emit_direction::<N, AX, PUSH, 1>(g, own, enemy, occ, unsafe { group_dst.add(n0) });
-        let n2 = self.emit_direction::<N, AX, PUSH, 2>(g, own, enemy, occ, unsafe {
-            group_dst.add(n0 + n1)
-        });
-        let n3 = self.emit_direction::<N, AX, PUSH, 3>(g, own, enemy, occ, unsafe {
-            group_dst.add(n0 + n1 + n2)
-        });
-        let n4 = self.emit_direction::<N, AX, PUSH, 4>(g, own, enemy, occ, unsafe {
-            group_dst.add(n0 + n1 + n2 + n3)
-        });
-        let n5 = self.emit_direction::<N, AX, PUSH, 5>(g, own, enemy, occ, unsafe {
-            group_dst.add(n0 + n1 + n2 + n3 + n4)
-        });
-        *written += n0 + n1 + n2 + n3 + n4 + n5;
+        // SAFETY: inherited buffer contract; each direction writes zero or one.
+        unsafe {
+            let group_dst = dst.add(*written);
+            let n0 = self.emit_direction::<N, AX, PUSH, 0>(g, own, enemy, occ, group_dst.add(0));
+            let n1 = self.emit_direction::<N, AX, PUSH, 1>(g, own, enemy, occ, group_dst.add(n0));
+            let n2 =
+                self.emit_direction::<N, AX, PUSH, 2>(g, own, enemy, occ, group_dst.add(n0 + n1));
+            let n3 = self.emit_direction::<N, AX, PUSH, 3>(
+                g,
+                own,
+                enemy,
+                occ,
+                group_dst.add(n0 + n1 + n2),
+            );
+            let n4 = self.emit_direction::<N, AX, PUSH, 4>(
+                g,
+                own,
+                enemy,
+                occ,
+                group_dst.add(n0 + n1 + n2 + n3),
+            );
+            let n5 = self.emit_direction::<N, AX, PUSH, 5>(
+                g,
+                own,
+                enemy,
+                occ,
+                group_dst.add(n0 + n1 + n2 + n3 + n4),
+            );
+            *written += n0 + n1 + n2 + n3 + n4 + n5;
+        }
     }
     #[inline(always)]
-    fn emit_direction<const N: usize, const AX: usize, const PUSH: bool, const D: usize>(
+    // SAFETY: dst is aligned/writable for one entry when g.directions[D] is Some,
+    // otherwise it may be one-past the buffer. N/AX match g and D < 6.
+    // Returns the initialized slot count (0 or 1).
+    unsafe fn emit_direction<const N: usize, const AX: usize, const PUSH: bool, const D: usize>(
         &self,
-        g: &crate::search::FastSourceGroup,
+        g: &FastSourceGroup,
         own: u64,
         enemy: u64,
         occ: u64,
-        dst: *mut crate::search::LegalMoveEntry,
+        dst: *mut LegalMoveEntry,
     ) -> usize {
         let Some(d) = &g.directions[D] else {
             return 0;
@@ -330,7 +345,7 @@ impl PositionState {
         };
         if let Some((is_push, is_ejection, enemy_effect)) = effect {
             unsafe {
-                dst.write(crate::search::LegalMoveEntry {
+                dst.write(LegalMoveEntry {
                     candidate_move: d.candidate_move,
                     is_push,
                     is_ejection,
@@ -350,7 +365,7 @@ impl PositionState {
     fn fast_inline_legality(
         &self,
         len: usize,
-        direction: &crate::search::FastGroupDirection,
+        direction: &FastGroupDirection,
         side_bits: u64,
         enemy_bits: u64,
         occupied_bits: u64,
@@ -407,24 +422,19 @@ impl PositionState {
         let undo = UndoSnapshot {
             previous_position: self.position,
         };
-        let own_toggle = crate::search::fast_movegen_tables().own_toggle(plan_index);
+        let own_toggle = fast_movegen_tables().own_toggle(plan_index);
         self.position
             .apply_toggle_masks(own_toggle, enemy_effect.toggle_mask());
         undo
     }
-    pub(crate) fn legal_move_entry(
-        &self,
-        candidate_move: &Move,
-    ) -> Option<crate::search::LegalMoveEntry> {
+    pub(crate) fn legal_move_entry(&self, candidate_move: &Move) -> Option<LegalMoveEntry> {
         let plan = self.analyze_move(candidate_move).ok()?;
-        let history_key = crate::search::history_group_key(
-            candidate_move.source_cells(),
-            candidate_move.direction(),
-        );
-        let tables = crate::search::fast_movegen_tables();
+        let history_key =
+            history_group_key(candidate_move.source_cells(), candidate_move.direction());
+        let tables = fast_movegen_tables();
         let plan_index = tables.plan_index(history_key)?;
         debug_assert_eq!(tables.own_toggle(plan_index), plan.own_toggle());
-        Some(crate::search::LegalMoveEntry {
+        Some(LegalMoveEntry {
             candidate_move: *candidate_move,
             is_ejection: plan.is_ejection(),
             is_push: plan.is_push(),
@@ -449,7 +459,7 @@ impl PositionState {
             return analyze_single_move(candidate_move, occupied_bits);
         }
         let axis = group_axis(candidate_move.source_cells())
-            .ok_or_else(|| MoveApplicationError::IllegalMove(*candidate_move))?;
+            .ok_or(MoveApplicationError::IllegalMove(*candidate_move))?;
         if is_inline(axis, candidate_move.direction()) {
             analyze_inline_move(candidate_move, enemy_bits, occupied_bits)
         } else {
@@ -538,7 +548,7 @@ fn analyze_single_move(
 ) -> Result<MovePlan, MoveApplicationError> {
     let source = candidate_move.source_cells()[0];
     let destination = neighbor_cell(source, candidate_move.direction())
-        .ok_or_else(|| MoveApplicationError::IllegalMove(*candidate_move))?;
+        .ok_or(MoveApplicationError::IllegalMove(*candidate_move))?;
     let destination_bit = 1u64 << destination.as_u8();
     if occupied_bits & destination_bit != 0 {
         return Err(MoveApplicationError::IllegalMove(*candidate_move));
@@ -564,9 +574,9 @@ fn analyze_inline_move(
     occupied_bits: u64,
 ) -> Result<MovePlan, MoveApplicationError> {
     let front = front_cell(candidate_move.source_cells(), candidate_move.direction())
-        .ok_or_else(|| MoveApplicationError::IllegalMove(*candidate_move))?;
+        .ok_or(MoveApplicationError::IllegalMove(*candidate_move))?;
     let first_ahead = neighbor_cell(front, candidate_move.direction())
-        .ok_or_else(|| MoveApplicationError::IllegalMove(*candidate_move))?;
+        .ok_or(MoveApplicationError::IllegalMove(*candidate_move))?;
     let first_bit = 1u64 << first_ahead.as_u8();
     let own_from = cells_mask(candidate_move.source_cells());
     let own_to = translated_mask(candidate_move.source_cells(), candidate_move.direction())?;
@@ -596,10 +606,10 @@ fn analyze_inline_move(
     if enemy_count >= candidate_move.len() {
         return Err(MoveApplicationError::IllegalMove(*candidate_move));
     }
-    if let Some(landing) = cursor {
-        if occupied_bits & (1u64 << landing.as_u8()) != 0 {
-            return Err(MoveApplicationError::IllegalMove(*candidate_move));
-        }
+    if let Some(landing) = cursor
+        && occupied_bits & (1u64 << landing.as_u8()) != 0
+    {
+        return Err(MoveApplicationError::IllegalMove(*candidate_move));
     }
     Ok(MovePlan {
         own_from,
@@ -682,6 +692,17 @@ fn front_cell(
         _ => None,
     }
 }
-fn neighbor_cell(cell: crate::board::CellId, direction: Direction) -> Option<crate::board::CellId> {
-    geometry().cell(cell).neighbors[direction.index()]
+
+pub(crate) fn reverse_move(candidate_move: Move) -> Option<Move> {
+    let geometry = geometry();
+    let mut destination_cells = [candidate_move.source_cells()[0]; 3];
+    for (index, cell) in candidate_move.source_cells().iter().copied().enumerate() {
+        destination_cells[index] =
+            geometry.cell(cell).neighbors[candidate_move.direction().index()]?;
+    }
+    Move::from_cells(
+        &destination_cells[..candidate_move.len()],
+        candidate_move.direction().opposite(),
+    )
+    .ok()
 }

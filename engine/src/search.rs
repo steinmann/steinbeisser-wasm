@@ -1,14 +1,19 @@
-use crate::board::{ALL_DIRECTIONS, Color, Direction, LineAxis, Move, Position, geometry};
+#[path = "search_cache.rs"]
+mod cache;
+use cache::*;
+
+pub use crate::board::MAX_GAME_TURNS;
+use crate::board::{Color, Move, Position};
 use crate::eval::{
     FeatureShape, NnueAccumulator, build_feature_shape, nnue, update_side_feature_shape,
 };
-use crate::movegen::{MoveApplicationError, PositionState, UndoSnapshot};
+use crate::movegen::{LegalMoveEntry, fast_movegen_tables, history_group_key};
+use crate::movegen::{PositionState, UndoSnapshot};
 use std::cmp::Reverse;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, Instant};
 #[cfg(target_arch = "wasm32")]
 use web_time::{Duration, Instant};
-pub const MAX_GAME_TURNS: u16 = 350;
 pub const WIN_SCORE: i32 = 100000;
 const SEARCH_SCORE_BOUND: i32 = WIN_SCORE + 10000;
 const TRANSPOSITION_TABLE_SIZE: usize = 1 << 16;
@@ -47,8 +52,6 @@ const HISTORY_LMR_THRESHOLD: i32 = 512;
 const CORRECTION_HISTORY_CLAMP: i32 = 192;
 const NULL_MOVE_MARGIN: i32 = 96;
 const PUSH_ORDER_BONUS: i32 = 650000;
-const HISTORY_SOURCE_GROUPS_LEN1: usize = crate::board::CELL_COUNT;
-const HISTORY_SOURCE_GROUPS_LEN2: usize = combination_count(crate::board::CELL_COUNT, 2);
 const HISTORY_SCORE_TABLE_SIZE: usize = 1734;
 const EVAL_CACHE_SEED: u64 = 0xA5A55A5A1F2E3D4C;
 const SEARCH_CONTEXT_KEY_SEED: u64 = 0xC6A4A7935BD1E995;
@@ -66,13 +69,11 @@ pub(crate) struct SearchDiagnostics {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SearchConfig {
-    use_fast_movegen: bool,
     use_transposition_backfill: bool,
     partial_sort_k: usize,
 }
 fn search_config() -> &'static SearchConfig {
     static CFG: SearchConfig = SearchConfig {
-        use_fast_movegen: true,
         use_transposition_backfill: false,
         partial_sort_k: 8,
     };
@@ -83,15 +84,6 @@ struct SearchHistory {
     no_progress: u16,
 }
 impl SearchHistory {
-    fn reset(
-        &mut self,
-        history_positions: &[PositionKey],
-        root_position: PositionKey,
-        no_progress_ply: u16,
-    ) {
-        let _ = (history_positions, root_position);
-        self.no_progress = no_progress_ply;
-    }
     fn child(&self, made_progress: bool) -> Self {
         Self {
             no_progress: if made_progress {
@@ -116,77 +108,6 @@ impl SearchHistory {
     }
 }
 
-#[derive(Clone, Debug)]
-struct EvalCache {
-    tagged_buckets: Vec<TaggedEvalBucket>,
-    index_bits: u32,
-    full_key_buckets: Vec<FullKeyEvalBucket>,
-    sets_mask: usize,
-}
-impl EvalCache {
-    fn new(size: usize) -> Self {
-        let sets = (size.max(EVAL_CACHE_WAYS) / EVAL_CACHE_WAYS)
-            .max(1)
-            .next_power_of_two();
-        Self {
-            tagged_buckets: if sets > 1 {
-                vec![
-                    TaggedEvalBucket {
-                        tags: [0; 4],
-                        scores: [0; 4]
-                    };
-                    sets
-                ]
-            } else {
-                Vec::new()
-            },
-            index_bits: sets.trailing_zeros(),
-            full_key_buckets: if sets == 1 {
-                vec![
-                    FullKeyEvalBucket {
-                        keys: [0; 4],
-                        scores: [0; 4],
-                        valid: 0
-                    };
-                    1
-                ]
-            } else {
-                Vec::new()
-            },
-            sets_mask: sets - 1,
-        }
-    }
-    fn probe(&self, key: u64) -> Option<i32> {
-        if self.index_bits == 0 {
-            return self.probe_full_key(key);
-        }
-        let b = &self.tagged_buckets[key as usize & self.sets_mask];
-        let tag = (key >> self.index_bits) | (1u64 << 63);
-        for w in 0..4 {
-            if b.tags[w] == tag {
-                return Some(b.scores[w]);
-            }
-        }
-        None
-    }
-    fn store(&mut self, key: u64, score: i32) {
-        if self.index_bits == 0 {
-            return self.store_full_key(key, score);
-        }
-        let b = &mut self.tagged_buckets[key as usize & self.sets_mask];
-        let tag = (key >> self.index_bits) | (1u64 << 63);
-        let w = (0..4)
-            .find(|&w| b.tags[w] == 0 || b.tags[w] == tag)
-            .unwrap_or((key >> 32) as usize & 3);
-        b.tags[w] = tag;
-        b.scores[w] = score;
-    }
-}
-impl Default for EvalCache {
-    fn default() -> Self {
-        Self::new(EVAL_CACHE_WAYS)
-    }
-}
 struct PersistentContext {
     generation: u8,
     transposition_table: TranspositionTable,
@@ -248,21 +169,12 @@ fn search_timed_position_with_turn(
     time_ms: u64,
     root_reverse_move: Option<Move>,
 ) -> Result<(SearchResult, SearchDiagnostics), String> {
-    let position_history_keys = position_history
-        .iter()
-        .map(PositionKey::from_position)
-        .collect::<Vec<_>>();
     let mut searcher = Searcher::new_timed(
         time_ms,
         root_reverse_move,
         position_history.len() <= 1 && no_progress_ply == 0,
     );
-    let result = searcher.search(
-        position,
-        &position_history_keys,
-        no_progress_ply,
-        turn_index.min(MAX_GAME_TURNS),
-    );
+    let result = searcher.search(position, no_progress_ply, turn_index.min(MAX_GAME_TURNS));
     searcher.persist();
     result
 }
@@ -274,22 +186,13 @@ fn search_raw_position_with_turn(
     time_ms: u64,
     root_reverse_move: Option<Move>,
 ) -> Result<(SearchResult, SearchDiagnostics), String> {
-    let position_history_keys = position_history
-        .iter()
-        .map(PositionKey::from_position)
-        .collect::<Vec<_>>();
     let mut searcher = Searcher::new_timed_with_poll(
         time_ms,
         root_reverse_move,
         position_history.len() <= 1 && no_progress_ply == 0,
         RAW_ABORT_POLL_MASK,
     );
-    let result = searcher.search(
-        position,
-        &position_history_keys,
-        no_progress_ply,
-        turn_index.min(MAX_GAME_TURNS),
-    );
+    let result = searcher.search(position, no_progress_ply, turn_index.min(MAX_GAME_TURNS));
     searcher.persist();
     result
 }
@@ -302,21 +205,12 @@ fn search_fixed_depth_position_with_turn(
     depth: u8,
     root_reverse_move: Option<Move>,
 ) -> Result<(SearchResult, SearchDiagnostics), String> {
-    let position_history_keys = position_history
-        .iter()
-        .map(PositionKey::from_position)
-        .collect::<Vec<_>>();
     let mut searcher = Searcher::new_fixed_depth(
         depth,
         root_reverse_move,
         position_history.len() <= 1 && no_progress_ply == 0,
     );
-    let result = searcher.search(
-        position,
-        &position_history_keys,
-        no_progress_ply,
-        turn_index.min(MAX_GAME_TURNS),
-    );
+    let result = searcher.search(position, no_progress_ply, turn_index.min(MAX_GAME_TURNS));
     searcher.persist();
     result
 }
@@ -348,22 +242,13 @@ pub fn search_timed_depth_with_turn(
     depth: u8,
     root_reverse_move: Option<Move>,
 ) -> Result<SearchResult, String> {
-    let position_history_keys = position_history
-        .iter()
-        .map(PositionKey::from_position)
-        .collect::<Vec<_>>();
     let mut searcher = Searcher::new_timed_depth(
         time_ms,
         depth,
         root_reverse_move,
         position_history.len() <= 1 && no_progress_ply == 0,
     );
-    let result = searcher.search(
-        position,
-        &position_history_keys,
-        no_progress_ply,
-        turn_index.min(MAX_GAME_TURNS),
-    );
+    let result = searcher.search(position, no_progress_ply, turn_index.min(MAX_GAME_TURNS));
     searcher.persist();
     result.map(|(result, _)| result)
 }
@@ -581,20 +466,12 @@ impl Searcher {
             .best_move_entry(key, depth)
             .and_then(|entry| entry.best_move)
     }
-    #[inline]
-    fn best_root_transposition_move(&self, key: u64, depth: u8) -> Option<Move> {
-        self.transposition_table
-            .best_move_entry(key, depth)
-            .and_then(|entry| entry.best_move)
-    }
+
     #[inline]
     fn store_transposition(&mut self, entry: TranspositionEntry) {
         self.transposition_table.store(entry);
     }
-    #[inline]
-    fn store_root_transposition(&mut self, entry: TranspositionEntry) {
-        self.transposition_table.store(entry);
-    }
+
     #[inline]
     fn turn_at_ply(&self, ply: u8) -> u16 {
         self.root_turn.saturating_add(u16::from(ply))
@@ -684,6 +561,10 @@ impl Searcher {
         *slot =
             updated_correction.clamp(-CORRECTION_HISTORY_CLAMP, CORRECTION_HISTORY_CLAMP) as i16;
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep benchmarked hot-path indexing and call structure unchanged."
+    )]
     fn update_tt_cutoff_correction(
         &mut self,
         position_state: &PositionState,
@@ -709,15 +590,15 @@ impl Searcher {
     pub(crate) fn search(
         &mut self,
         position: &Position,
-        history_scores: &[PositionKey],
         no_progress_ply: u16,
         turn_index: u16,
     ) -> Result<(SearchResult, SearchDiagnostics), String> {
-        let mut position_state = PositionState::new(position.clone()).map_err(|_| String::new())?;
+        let mut position_state = PositionState::new(*position).map_err(|_| String::new())?;
         let root_position_key = PositionKey::from_position(position);
         self.root_position_hash = position_hash(root_position_key);
-        let mut history = SearchHistory::default();
-        history.reset(history_scores, root_position_key, no_progress_ply);
+        let mut history = SearchHistory {
+            no_progress: no_progress_ply,
+        };
         self.root_turn = turn_index;
         self.root_no_progress = no_progress_ply;
         self.accumulators.clear();
@@ -741,7 +622,6 @@ impl Searcher {
         };
         let mut last_iteration_ms = 0u64;
         let mut previous_iteration_ms = 0u64;
-        let mut stable_best_iterations = 0u8;
         if terminal_score(position, 0, self.turn_at_ply(0)).is_some() {
             best_result.score = terminal_score(position, 0, self.turn_at_ply(0)).unwrap_or(0);
             return Ok((best_result, self.diagnostics));
@@ -755,12 +635,10 @@ impl Searcher {
                 best_result.depth,
                 last_iteration_ms,
                 previous_iteration_ms,
-                stable_best_iterations,
             ) {
                 break;
             }
             let iteration_started = Instant::now();
-            let last_best_before_iteration = previous_best_move;
             match self.search_root(
                 &mut position_state,
                 depth,
@@ -771,19 +649,13 @@ impl Searcher {
             ) {
                 Ok((score, best_move)) => {
                     best_result = SearchResult {
-                        best_move: best_move,
+                        best_move,
                         score,
-                        depth: depth,
+                        depth,
                         nodes: self.nodes,
                     };
                     previous_best_move = best_move;
                     previous_score = score;
-                    stable_best_iterations =
-                        if best_move.is_some() && best_move == last_best_before_iteration {
-                            stable_best_iterations.saturating_add(1)
-                        } else {
-                            0
-                        };
                 }
                 Err(SearchAbort) => break,
             }
@@ -811,8 +683,8 @@ impl Searcher {
             let candidate_move = move_entry.candidate_move;
             let order =
                 self.move_order_score(side, move_entry, None, None, None, None, none_killers);
-            self.push_move_entry(position_state, move_entry);
-            let undo = self.apply_move_entry(position_state, move_entry).unwrap();
+            self.push_move_state(position_state, move_entry);
+            let undo = self.apply_move_entry(position_state, move_entry);
             let child_no_progress = if move_entry.is_ejection {
                 0
             } else {
@@ -936,12 +808,12 @@ impl Searcher {
         self.check_abort()?;
         let root_key =
             history.search_key_from_position_hash(self.root_position_hash, self.turn_at_ply(0));
-        let transposition_move = self.best_root_transposition_move(root_key, depth);
+        let transposition_move = self.best_transposition_move(root_key, depth);
         let mut priority_count = 0usize;
         let mut priority_moves = [None; 4];
         let mut best_score = -SEARCH_SCORE_BOUND;
         let mut best_move = None;
-        let original_alpha;
+
         for candidate_move in [transposition_move, previous_best_move, None]
             .into_iter()
             .flatten()
@@ -961,8 +833,8 @@ impl Searcher {
             } else {
                 0
             };
-            self.push_move_entry(position_state, move_entry);
-            let undo = self.apply_move_entry(position_state, move_entry).unwrap();
+            self.push_move_state(position_state, move_entry);
+            let undo = self.apply_move_entry(position_state, move_entry);
             let mut child_history = history.child(move_entry.is_ejection);
             let history = &mut child_history;
 
@@ -1006,9 +878,9 @@ impl Searcher {
                 if is_quiet {
                     self.record_killer(0, candidate_move);
                 }
-                self.store_root_transposition(TranspositionEntry {
+                self.store_transposition(TranspositionEntry {
                     key: root_key,
-                    depth: depth,
+                    depth,
                     generation: self.generation,
                     score: encode_tt_score(score, 0),
                     bound: BoundKind::Lower,
@@ -1018,7 +890,7 @@ impl Searcher {
                 return Ok((score, Some(candidate_move)));
             }
         }
-        original_alpha = alpha;
+        let original_alpha = alpha;
         let mut move_entries = self.take_move_buffer(0);
         position_state.generate_fast_legal_moves(&mut move_entries);
         if priority_count > 0 {
@@ -1053,8 +925,8 @@ impl Searcher {
             } else {
                 0
             };
-            self.push_move_entry(position_state, move_entry);
-            let undo = self.apply_move_entry(position_state, move_entry).unwrap();
+            self.push_move_state(position_state, move_entry);
+            let undo = self.apply_move_entry(position_state, move_entry);
             let mut child_history = history.child(move_entry.is_ejection);
             let history = &mut child_history;
 
@@ -1098,9 +970,9 @@ impl Searcher {
                 if is_quiet {
                     self.record_killer(0, candidate_move);
                 }
-                self.store_root_transposition(TranspositionEntry {
+                self.store_transposition(TranspositionEntry {
                     key: root_key,
-                    depth: depth,
+                    depth,
                     generation: self.generation,
                     score: encode_tt_score(score, 0),
                     bound: BoundKind::Lower,
@@ -1111,9 +983,9 @@ impl Searcher {
                 return Ok((score, Some(candidate_move)));
             }
         }
-        self.store_root_transposition(TranspositionEntry {
+        self.store_transposition(TranspositionEntry {
             key: root_key,
-            depth: depth,
+            depth,
             generation: self.generation,
             score: encode_tt_score(best_score, 0),
             bound: if best_score <= original_alpha {
@@ -1121,12 +993,16 @@ impl Searcher {
             } else {
                 BoundKind::Exact
             },
-            best_move: best_move,
+            best_move,
             exact_terminal: self.terminal_horizon_requires_exact_search(0, depth),
         });
         self.recycle_scored_move_buffer(0, move_entries);
         Ok((best_score, best_move))
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep benchmarked hot-path indexing and call structure unchanged."
+    )]
     fn search_move_score(
         &mut self,
         position_state: &mut PositionState,
@@ -1217,6 +1093,10 @@ impl Searcher {
         }
         Ok(score)
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep benchmarked hot-path indexing and call structure unchanged."
+    )]
     fn negamax(
         &mut self,
         position_state: &mut PositionState,
@@ -1464,8 +1344,8 @@ impl Searcher {
             } else {
                 0
             };
-            self.push_move_entry(position_state, move_entry);
-            let undo = self.apply_move_entry(position_state, move_entry).unwrap();
+            self.push_move_state(position_state, move_entry);
+            let undo = self.apply_move_entry(position_state, move_entry);
             let mut child_history = history.child(move_entry.is_ejection);
             let history = &mut child_history;
 
@@ -1511,7 +1391,7 @@ impl Searcher {
                 }
                 self.store_transposition(TranspositionEntry {
                     key,
-                    depth: depth,
+                    depth,
                     generation: self.generation,
                     score: encode_tt_score(score, ply),
                     bound: BoundKind::Lower,
@@ -1580,8 +1460,8 @@ impl Searcher {
             {
                 continue;
             }
-            self.push_move_entry(position_state, move_entry);
-            let undo = self.apply_move_entry(position_state, move_entry).unwrap();
+            self.push_move_state(position_state, move_entry);
+            let undo = self.apply_move_entry(position_state, move_entry);
             let mut child_history = history.child(move_entry.is_ejection);
             let history = &mut child_history;
 
@@ -1627,7 +1507,7 @@ impl Searcher {
                 }
                 self.store_transposition(TranspositionEntry {
                     key,
-                    depth: depth,
+                    depth,
                     generation: self.generation,
                     score: encode_tt_score(score, ply),
                     bound: BoundKind::Lower,
@@ -1651,7 +1531,7 @@ impl Searcher {
         }
         self.store_transposition(TranspositionEntry {
             key,
-            depth: depth,
+            depth,
             generation: self.generation,
             score: encode_tt_score(best_score, ply),
             bound: if best_score <= original_alpha {
@@ -1659,7 +1539,7 @@ impl Searcher {
             } else {
                 BoundKind::Exact
             },
-            best_move: best_move,
+            best_move,
             exact_terminal: exact_terminal_horizon,
         });
         if let Some(raw) = raw_static {
@@ -1668,6 +1548,10 @@ impl Searcher {
         self.recycle_scored_move_buffer(ply as usize, move_entries);
         Ok(best_score)
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep benchmarked hot-path indexing and call structure unchanged."
+    )]
     fn tactical_leaf_score(
         &mut self,
         position_state: &mut PositionState,
@@ -1702,8 +1586,8 @@ impl Searcher {
 
         for move_entry in move_entries.iter().map(|x| x.1) {
             self.check_abort()?;
-            self.push_move_entry(position_state, move_entry);
-            let undo = self.apply_move_entry(position_state, move_entry).unwrap();
+            self.push_move_state(position_state, move_entry);
+            let undo = self.apply_move_entry(position_state, move_entry);
             let mut child_history = history.child(move_entry.is_ejection);
             let history = &mut child_history;
 
@@ -1738,6 +1622,10 @@ impl Searcher {
         Ok(best)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep benchmarked hot-path indexing and call structure unchanged."
+    )]
     fn order_moves_scored(
         &mut self,
         side: Color,
@@ -1787,6 +1675,10 @@ impl Searcher {
         scored
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep benchmarked hot-path indexing and call structure unchanged."
+    )]
     fn move_order_score(
         &self,
         side: Color,
@@ -1808,6 +1700,10 @@ impl Searcher {
             killers.map(|m| m.map(key)),
         )
     }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Keep benchmarked hot-path indexing and call structure unchanged."
+    )]
     fn move_order_score_keys(
         &self,
         side: Color,
@@ -1818,35 +1714,23 @@ impl Searcher {
         followup_key: Option<u32>,
         killers: [Option<u32>; 2],
     ) -> i32 {
-        let candidate_move = move_entry.history_key;
-        if Some(candidate_move) == principal_variation_move {
-            return 4000000;
-        }
-        if Some(candidate_move) == transposition_move {
-            return 3000000;
-        }
-        if Some(candidate_move) == killers[0] {
-            return 2000000;
-        }
-        if Some(candidate_move) == killers[1] {
-            return 1000000;
-        }
-        if Some(move_entry.history_key) == countermove_key {
-            return COUNTERMOVE_ORDER_BONUS + self.history_score(side, move_entry.plan_index);
-        }
-        if Some(move_entry.history_key) == followup_key {
-            return FOLLOWUP_ORDER_BONUS + self.history_score(side, move_entry.plan_index);
-        }
-        if move_entry.is_ejection {
-            return EJECTION_ORDER_BONUS + self.history_score(side, move_entry.plan_index);
-        }
-        if move_entry.is_push {
-            return PUSH_ORDER_BONUS
-                + i32::try_from(move_entry.candidate_move.len()).unwrap_or(0) * 10000
-                + self.history_score(side, move_entry.plan_index);
-        }
-        self.history_score(side, move_entry.plan_index)
+        // Emergency ordering uses the same priority rules as normal ordering.
+        // Real history keys cannot equal the absent-key sentinel u32::MAX.
+        let context = MoveOrderContext {
+            history: &self.history_scores[side_index(side)],
+            keys: [
+                principal_variation_move,
+                transposition_move,
+                killers[0],
+                killers[1],
+                countermove_key,
+                followup_key,
+            ]
+            .map(|key| key.unwrap_or(u32::MAX)),
+        };
+        context_move_order_score(&context, move_entry)
     }
+
     fn history_score(&self, side: Color, plan_index: u16) -> i32 {
         i32::from(self.history_scores[side_index(side)][plan_index as usize])
     }
@@ -1915,8 +1799,7 @@ impl Searcher {
         self.followups[side_index(side)][index] =
             (u64::from(own_previous_key) << 32) | u64::from(reply_key.saturating_add(1));
     }
-    fn current_shape(&mut self, position_state: &PositionState) -> &FeatureShape {
-        let _ = position_state;
+    fn current_shape(&self) -> &FeatureShape {
         self.feature_shapes.last().unwrap()
     }
     fn push_move_state(&mut self, position_state: &PositionState, move_entry: LegalMoveEntry) {
@@ -1965,19 +1848,17 @@ impl Searcher {
         }
         self.feature_shapes.push(shape);
     }
-    fn push_move_entry(&mut self, position_state: &PositionState, move_entry: LegalMoveEntry) {
-        self.push_move_state(position_state, move_entry);
-    }
+
     fn apply_move_entry(
         &mut self,
         position_state: &mut PositionState,
         move_entry: LegalMoveEntry,
-    ) -> Result<UndoSnapshot, MoveApplicationError> {
+    ) -> UndoSnapshot {
         debug_assert_eq!(
             position_state.legal_move_entry(&move_entry.candidate_move),
             Some(move_entry)
         );
-        Ok(position_state.apply_legal_effect(move_entry.plan_index, move_entry.enemy_effect))
+        position_state.apply_legal_effect(move_entry.plan_index, move_entry.enemy_effect)
     }
     fn undo_move_entry(&mut self, position_state: &mut PositionState, undo: UndoSnapshot) {
         position_state.undo_move(undo);
@@ -2014,12 +1895,10 @@ impl Searcher {
         if let Some(score) = self.eval_cache.probe(key) {
             return score;
         }
-        let shape = *self.current_shape(position_state);
+        let shape = *self.current_shape();
         let score = nnue().evaluate_with_accumulator_bits(
             position_state.position().side_to_move() == Color::Black,
             &shape,
-            position_state.black_bits(),
-            position_state.white_bits(),
             turn_index as f32,
             no_progress_ply as f32,
             self.accumulators.last().unwrap(),
@@ -2033,7 +1912,6 @@ impl Searcher {
         completed_depth: u8,
         last_iteration_ms: u64,
         previous_iteration_ms: u64,
-        stable_best_iterations: u8,
     ) -> bool {
         let terminal_limit = self.terminal_depth_limit();
         if depth > terminal_limit || completed_depth >= terminal_limit {
@@ -2066,7 +1944,6 @@ impl Searcher {
             last_iteration_ms.saturating_mul(39).div_ceil(20)
         };
         let estimated_next_ms = ratio_estimate.max(last_iteration_ms + 1);
-        let _ = stable_best_iterations;
         estimated_next_ms <= remaining_ms.saturating_add(DEPTH_ADMISSION_MARGIN_MS)
     }
     fn record_killer(&mut self, ply: usize, candidate_move: Move) {
@@ -2100,272 +1977,8 @@ fn deadline_slack_ms(time_ms: u64) -> u64 {
     };
     slack_cap.min((time_ms / 8).max(1))
 }
-pub(crate) fn move_group_axis(source_cells: &[crate::board::CellId]) -> Option<LineAxis> {
-    let geometry = geometry();
-    let first = geometry.cell(source_cells[0]);
-    [LineAxis::Q, LineAxis::R, LineAxis::S]
-        .into_iter()
-        .find(|axis| {
-            let axis_index = axis.index();
-            let line_id = first.line_ids[axis_index];
-            source_cells
-                .iter()
-                .all(|cell| geometry.cell(*cell).line_ids[axis_index] == line_id)
-        })
-}
-pub(crate) fn move_is_inline(axis: LineAxis, direction: Direction) -> bool {
-    match axis {
-        LineAxis::Q => matches!(direction, Direction::Se | Direction::Nw),
-        LineAxis::R => matches!(direction, Direction::East | Direction::West),
-        LineAxis::S => matches!(direction, Direction::Ne | Direction::Sw),
-    }
-}
-pub(crate) fn move_front_cell(
-    source_cells: &[crate::board::CellId],
-    direction: Direction,
-) -> Option<crate::board::CellId> {
-    match source_cells {
-        [] => None,
-        [first] => Some(*first),
-        [first, second] => {
-            if neighbor_cell(*first, direction) == Some(*second) {
-                Some(*second)
-            } else {
-                Some(*first)
-            }
-        }
-        [first, second, third] => {
-            if neighbor_cell(*first, direction) == Some(*second)
-                && neighbor_cell(*second, direction) == Some(*third)
-            {
-                Some(*third)
-            } else {
-                Some(*first)
-            }
-        }
-        _ => None,
-    }
-}
-pub(crate) fn neighbor_cell(
-    cell: crate::board::CellId,
-    direction: Direction,
-) -> Option<crate::board::CellId> {
-    geometry().cell(cell).neighbors[direction.index()]
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FastGroupDirection {
-    pub(crate) candidate_move: Move,
-    pub(crate) inline: bool,
-    pub(crate) translated_mask: u64,
-    pub(crate) history_key: u32,
-    pub(crate) plan_index: u16,
-    pub(crate) ray_bits: [u64; 3],
-    pub(crate) landing: [Option<crate::board::CellId>; 2],
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FastSourceGroup {
-    pub(crate) axis: u8,
-    pub(crate) len: u8,
-    pub(crate) source_mask: u64,
-    pub(crate) directions: [Option<FastGroupDirection>; 6],
-}
-#[derive(Clone, Debug)]
-pub(crate) struct FastMovegenTables {
-    pub(crate) source_masks: Vec<u64>,
-    pub(crate) source_groups: Vec<FastSourceGroup>,
-    pub(crate) owned_groups: OwnedGroupTables,
-    plans: Vec<FastMovePlan>,
-    plan_hash: Vec<(u32, u16)>,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FastMovePlan {
-    own_toggle: u64,
-}
-impl FastMovegenTables {
-    pub(crate) fn plan_count(&self) -> usize {
-        self.plans.len()
-    }
-    pub(crate) fn own_toggle(&self, plan_index: u16) -> u64 {
-        self.plans[plan_index as usize].own_toggle
-    }
-    pub(crate) fn plan_index(&self, k: u32) -> Option<u16> {
-        let mut i = k.wrapping_mul(0x9e3779b9) as usize & (self.plan_hash.len() - 1);
-        loop {
-            let (key, p) = self.plan_hash[i];
-            if p == u16::MAX {
-                return None;
-            }
-            if key == k {
-                return Some(p);
-            }
-            i = (i + 1) & (self.plan_hash.len() - 1);
-        }
-    }
-}
-pub(crate) fn fast_movegen_tables() -> &'static FastMovegenTables {
-    static TABLES: std::sync::OnceLock<FastMovegenTables> = std::sync::OnceLock::new();
-    TABLES.get_or_init(build_fast_movegen_tables)
-}
-fn build_fast_movegen_tables() -> FastMovegenTables {
-    let geom = geometry();
-    let mut source_groups = Vec::with_capacity(256);
-    let mut plans = Vec::with_capacity(2048);
-    for cell in geom.cells().iter().map(|cell| cell.index) {
-        let cells = [cell, cell, cell];
-        let source_mask = 1u64 << cell.as_u8();
-        let directions = build_fast_group_directions(&cells, 1, None, source_mask, &mut plans);
-        source_groups.push(FastSourceGroup {
-            axis: 3,
-            len: 1,
-            source_mask,
-            directions,
-        });
-    }
-    for axis in [LineAxis::Q, LineAxis::R, LineAxis::S] {
-        for line in geom.lines(axis) {
-            for len in 2..=3 {
-                if line.cells.len() < len {
-                    continue;
-                }
-                for start in 0..=line.cells.len() - len {
-                    let cells = canonical_group_cells(&line.cells[start..start + len]);
-                    let source_mask = fast_source_mask(&cells, len as u8);
-                    let directions = build_fast_group_directions(
-                        &cells,
-                        len as u8,
-                        Some(axis),
-                        source_mask,
-                        &mut plans,
-                    );
-                    source_groups.push(FastSourceGroup {
-                        axis: axis.index() as u8,
-                        len: len as u8,
-                        source_mask,
-                        directions,
-                    });
-                }
-            }
-        }
-    }
-    debug_assert!(source_groups.len() <= 6 * 64);
-    let mut plan_lookup = source_groups
-        .iter()
-        .flat_map(|group| group.directions.iter().flatten())
-        .map(|direction| (direction.history_key, direction.plan_index))
-        .collect::<Vec<_>>();
-    plan_lookup.sort_unstable_by_key(|entry| entry.0);
-    debug_assert!(plan_lookup.windows(2).all(|pair| pair[0].0 != pair[1].0));
-    let owned_groups = OwnedGroupTables::new(&source_groups);
-    let mut plan_hash = vec![(0u32, u16::MAX); (plan_lookup.len() * 2).next_power_of_two()];
-    for &(k, p) in &plan_lookup {
-        let mut i = k.wrapping_mul(0x9e3779b9) as usize & (plan_hash.len() - 1);
-        while plan_hash[i].1 != u16::MAX {
-            i = (i + 1) & (plan_hash.len() - 1);
-        }
-        plan_hash[i] = (k, p);
-    }
-    FastMovegenTables {
-        plan_hash,
-        owned_groups,
-        source_masks: source_groups.iter().map(|g| g.source_mask).collect(),
-        source_groups,
-        plans,
-    }
-}
-fn build_fast_group_directions(
-    cells: &[crate::board::CellId; 3],
-    len: u8,
-    axis: Option<LineAxis>,
-    source_mask: u64,
-    plans: &mut Vec<FastMovePlan>,
-) -> [Option<FastGroupDirection>; 6] {
-    std::array::from_fn(|dir_idx| {
-        let direction = ALL_DIRECTIONS[dir_idx];
-        let group = &cells[..len as usize];
-        let translated = build_fast_translated_cells(group, direction)?;
-        let translated_mask = translated
-            .iter()
-            .flatten()
-            .fold(0u64, |mask, cell| mask | (1u64 << cell.as_u8()));
-        let (inline, first_step) = match axis {
-            None => (false, translated[0]),
-            Some(axis) => {
-                let inline = move_is_inline(axis, direction);
-                let front = move_front_cell(group, direction)?;
-                let first_step = if inline {
-                    neighbor_cell(front, direction)
-                } else {
-                    translated[0]
-                };
-                if inline && first_step.is_none() {
-                    return None;
-                }
-                (inline, first_step)
-            }
-        };
-        let mut ray_bits = [0u64; 3];
-        let mut landing = [None; 2];
-        let mut current = first_step;
-        for index in 0..3 {
-            let Some(cell) = current else {
-                break;
-            };
-            ray_bits[index] = 1u64 << cell.as_u8();
-            if index > 0 {
-                landing[index - 1] = Some(cell);
-            }
-            current = geometry().cell(cell).neighbors[direction.index()];
-        }
-        let plan_index = u16::try_from(plans.len()).expect("fast move plan count fits u16");
-        plans.push(FastMovePlan {
-            own_toggle: source_mask ^ translated_mask,
-        });
-        Some(FastGroupDirection {
-            candidate_move: Move::new_unchecked(group, direction),
-            inline,
-            translated_mask,
-            history_key: history_group_key(group, direction),
-            plan_index,
-            ray_bits,
-            landing,
-        })
-    })
-}
-fn canonical_group_cells(group: &[crate::board::CellId]) -> [crate::board::CellId; 3] {
-    let mut out = [group[0]; 3];
-    for (index, cell) in group.iter().copied().enumerate() {
-        out[index] = cell;
-    }
-    out[..group.len()].sort_unstable();
-    out
-}
-fn build_fast_translated_cells(
-    cells: &[crate::board::CellId],
-    direction: Direction,
-) -> Option<[Option<crate::board::CellId>; 3]> {
-    let geom = geometry();
-    let mut translated = [None; 3];
-    for (index, cell) in cells.iter().copied().enumerate() {
-        translated[index] = Some(geom.cell(cell).neighbors[direction.index()]?);
-    }
-    Some(translated)
-}
-fn fast_source_mask(cells: &[crate::board::CellId; 3], len: u8) -> u64 {
-    cells[..len as usize]
-        .iter()
-        .fold(0u64, |mask, cell| mask | (1u64 << cell.as_u8()))
-}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SearchAbort;
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct LegalMoveEntry {
-    pub(crate) candidate_move: Move,
-    pub(crate) is_ejection: bool,
-    pub(crate) is_push: bool,
-    pub(crate) history_key: u32,
-    pub(crate) plan_index: u16,
-    pub(crate) enemy_effect: crate::movegen::CompactEnemyEffect,
-}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PositionKey {
     side_to_move: Color,
@@ -2388,129 +2001,6 @@ impl PositionKey {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BoundKind {
-    Exact,
-    Lower,
-    Upper,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TranspositionEntry {
-    key: u64,
-    depth: u8,
-    generation: u8,
-    score: i32,
-    bound: BoundKind,
-    best_move: Option<Move>,
-    exact_terminal: bool,
-}
-#[derive(Clone)]
-struct TranspositionTable {
-    index_mask: Option<usize>,
-    keys: Vec<[u64; 2]>,
-    payloads: Vec<[Option<TranspositionPayload>; 2]>,
-}
-impl TranspositionTable {
-    #[inline]
-    fn index(&self, k: u64) -> usize {
-        match self.index_mask {
-            Some(m) => k as usize & m,
-            None => k as usize % self.keys.len(),
-        }
-    }
-    fn entry_capacity_for_size(size: usize) -> usize {
-        size.div_ceil(2).max(1) * 2
-    }
-    fn new(size: usize) -> Self {
-        let n = size.div_ceil(2).max(1);
-        Self {
-            index_mask: n.is_power_of_two().then_some(n - 1),
-            keys: vec![[0; 2]; n],
-            payloads: vec![[None; 2]; n],
-        }
-    }
-    fn entry_capacity(&self) -> usize {
-        self.keys.len() * 2
-    }
-    fn probe(&self, key: u64, depth: u8) -> Option<TranspositionEntry> {
-        let b = self.index(key);
-        let mut best = None;
-        for w in 0..2 {
-            if self.keys[b][w] == key {
-                if let Some(p) = self.payloads[b][w] {
-                    let e = p.entry(key);
-                    if e.depth >= depth
-                        && best.is_none_or(|old: TranspositionEntry| e.depth > old.depth)
-                    {
-                        best = Some(e);
-                    }
-                }
-            }
-        }
-        best
-    }
-    fn best_move_entry(&self, key: u64, depth: u8) -> Option<TranspositionEntry> {
-        let b = self.index(key);
-        let mut best = None;
-        for w in 0..2 {
-            if self.keys[b][w] == key {
-                if let Some(p) = self.payloads[b][w] {
-                    let e = p.entry(key);
-                    if e.depth >= depth
-                        || best.is_none_or(|old: TranspositionEntry| e.depth > old.depth)
-                    {
-                        best = Some(e);
-                    }
-                }
-            }
-        }
-        best
-    }
-    fn store(&mut self, e: TranspositionEntry) {
-        let b = self.index(e.key);
-        let mut selected = None;
-        for w in 0..2 {
-            match self.payloads[b][w] {
-                Some(p) if self.keys[b][w] == e.key => {
-                    if p.depth <= e.depth || p.generation != e.generation {
-                        selected = Some(w);
-                    }
-                    if let Some(w) = selected {
-                        self.keys[b][w] = e.key;
-                        self.payloads[b][w] = Some(TranspositionPayload::from(e));
-                    }
-                    return;
-                }
-                None => {
-                    selected = Some(w);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        if selected.is_none() {
-            let a = self.payloads[b][0].unwrap();
-            let z = self.payloads[b][1].unwrap();
-            let sa = a.generation != e.generation;
-            let sz = z.generation != e.generation;
-            let w = usize::from((sz && !sa) || (sz == sa && z.depth < a.depth));
-            let p = self.payloads[b][w].unwrap();
-            if p.generation != e.generation || p.depth <= e.depth {
-                selected = Some(w);
-            }
-        }
-        if let Some(w) = selected {
-            self.keys[b][w] = e.key;
-            self.payloads[b][w] = Some(TranspositionPayload::from(e));
-        }
-    }
-}
-impl Default for TranspositionTable {
-    fn default() -> Self {
-        Self::new(2)
-    }
-}
-
 fn position_hash(position_key: PositionKey) -> u64 {
     splitmix64(
         position_key.black_bits
@@ -2544,45 +2034,6 @@ fn decode_tt_score(score: i32, ply: u8) -> i32 {
     } else {
         score
     }
-}
-const fn combination_count(n: usize, k: usize) -> usize {
-    match k {
-        0 => 1,
-        1 => n,
-        2 => (n * (n - 1)) / 2,
-        3 => (n * (n - 1) * (n - 2)) / 6,
-        _ => 0,
-    }
-}
-pub(crate) fn history_group_key(
-    source_cells: &[crate::board::CellId],
-    direction: Direction,
-) -> u32 {
-    (history_source_group_rank(source_cells) * 6 + direction.index()) as u32
-}
-fn history_source_group_rank(source_cells: &[crate::board::CellId]) -> usize {
-    match source_cells {
-        [first] => first.as_usize(),
-        [first, second] => HISTORY_SOURCE_GROUPS_LEN1 + combination_rank_2(*first, *second),
-        [first, second, third] => {
-            HISTORY_SOURCE_GROUPS_LEN1
-                + HISTORY_SOURCE_GROUPS_LEN2
-                + combination_rank_3(*first, *second, *third)
-        }
-        _ => unreachable!("move source groups must contain 1..=3 cells"),
-    }
-}
-fn combination_rank_2(first: crate::board::CellId, second: crate::board::CellId) -> usize {
-    combination_count(first.as_usize(), 1) + combination_count(second.as_usize(), 2)
-}
-fn combination_rank_3(
-    first: crate::board::CellId,
-    second: crate::board::CellId,
-    third: crate::board::CellId,
-) -> usize {
-    combination_count(first.as_usize(), 1)
-        + combination_count(second.as_usize(), 2)
-        + combination_count(third.as_usize(), 3)
 }
 fn late_move_reduction(depth: u8, move_index: usize) -> u8 {
     let raw = 1u8
@@ -2620,112 +2071,6 @@ fn terminal_score(position: &Position, ply: u8, turn_index: u16) -> Option<i32> 
     })
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct OwnedGroupTables {
-    shifts: [Vec<(i8, u64)>; 6],
-    ids: [[[u16; 61]; 6]; 2],
-}
-impl OwnedGroupTables {
-    fn new(groups: &[FastSourceGroup]) -> Self {
-        let geom = geometry();
-        let mut masks = [[0u64; 19]; 6];
-        for c in geom.cells() {
-            for d in 0..6 {
-                if let Some(n) = c.neighbors[d] {
-                    let delta = n.as_u8() as i8 - c.index.as_u8() as i8;
-                    assert!((-9..=9).contains(&delta));
-                    masks[d][(delta + 9) as usize] |= 1u64 << c.index.as_u8();
-                }
-            }
-        }
-        let shifts = std::array::from_fn(|d| {
-            masks[d]
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &m)| if m == 0 { None } else { Some((i as i8 - 9, m)) })
-                .collect()
-        });
-        let mut ids = [[[u16::MAX; 61]; 6]; 2];
-        for (id, g) in groups.iter().enumerate() {
-            if g.len < 2 {
-                assert_eq!(id, g.source_mask.trailing_zeros() as usize);
-                continue;
-            }
-            let a = g.source_mask.trailing_zeros() as usize;
-            let rest = g.source_mask & (g.source_mask - 1);
-            let b = rest.trailing_zeros() as u8;
-            let d = geom.cells()[a]
-                .neighbors
-                .iter()
-                .position(|x| x.is_some_and(|c| c.as_u8() == b))
-                .unwrap();
-            ids[g.len as usize - 2][d][a] = id as u16;
-        }
-        Self { shifts, ids }
-    }
-    #[inline]
-    fn backshift(&self, bits: u64, d: usize) -> u64 {
-        let mut out = 0;
-        for &(delta, mask) in &self.shifts[d] {
-            out |= if delta >= 0 {
-                (bits >> (delta as u32)) & mask
-            } else {
-                (bits << (-delta as u32)) & mask
-            };
-        }
-        out
-    }
-    pub(crate) fn generate(&self, own: u64) -> [u64; 6] {
-        let mut out = [0u64; 6];
-        out[0] = own;
-        for d in 0..3 {
-            let n = self.backshift(own, d);
-            for (k, mut active) in [own & n, own & n & self.backshift(n, d)]
-                .into_iter()
-                .enumerate()
-            {
-                while active != 0 {
-                    let c = active.trailing_zeros() as usize;
-                    active &= active - 1;
-                    let id = self.ids[k][d][c];
-                    if id != u16::MAX {
-                        out[id as usize / 64] |= 1u64 << (id as usize % 64);
-                    }
-                }
-            }
-        }
-        out
-    }
-}
-
-impl OwnedGroupTables {
-    pub(crate) fn generate_push(&self, own: u64, enemy: u64) -> [u64; 6] {
-        let mut out = [0u64; 6];
-        for d in 0..3 {
-            let n = self.backshift(own, d);
-            let far = self.backshift(self.backshift(enemy, d), d);
-            let near = self.backshift(enemy, (d + 3) % 6);
-            for (k, mut active) in [
-                (own & n) & (far | near),
-                (own & n & self.backshift(n, d)) & (self.backshift(far, d) | near),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                while active != 0 {
-                    let c = active.trailing_zeros() as usize;
-                    active &= active - 1;
-                    let id = self.ids[k][d][c];
-                    if id != u16::MAX {
-                        out[id as usize / 64] |= 1u64 << (id as usize % 64);
-                    }
-                }
-            }
-        }
-        out
-    }
-}
-
 struct MoveOrderContext<'a> {
     history: &'a [i16],
     keys: [u32; 6],
@@ -2741,7 +2086,8 @@ fn context_move_order_score(ctx: &MoveOrderContext, move_entry: LegalMoveEntry) 
         2 => return 2000000,
         3 => return 1000000,
         4 => {
-            return COUNTERMOVE_ORDER_BONUS + i32::from(ctx.history[move_entry.plan_index as usize]);
+            return COUNTERMOVE_ORDER_BONUS
+                + i32::from(ctx.history[move_entry.plan_index as usize]);
         }
         5 => return FOLLOWUP_ORDER_BONUS + i32::from(ctx.history[move_entry.plan_index as usize]),
         _ => {}
@@ -2755,73 +2101,6 @@ fn context_move_order_score(ctx: &MoveOrderContext, move_entry: LegalMoveEntry) 
             + i32::from(ctx.history[move_entry.plan_index as usize]);
     }
     i32::from(ctx.history[move_entry.plan_index as usize])
-}
-
-#[derive(Clone, Copy)]
-struct TranspositionPayload {
-    score: i32,
-    depth: u8,
-    generation: u8,
-    bound: BoundKind,
-    best_move: Option<Move>,
-    exact_terminal: bool,
-}
-impl TranspositionPayload {
-    fn from(e: TranspositionEntry) -> Self {
-        Self {
-            score: e.score,
-            depth: e.depth,
-            generation: e.generation,
-            bound: e.bound,
-            best_move: e.best_move,
-            exact_terminal: e.exact_terminal,
-        }
-    }
-    fn entry(self, key: u64) -> TranspositionEntry {
-        TranspositionEntry {
-            key,
-            score: self.score,
-            depth: self.depth,
-            generation: self.generation,
-            bound: self.bound,
-            best_move: self.best_move,
-            exact_terminal: self.exact_terminal,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct FullKeyEvalBucket {
-    keys: [u64; 4],
-    scores: [i32; 4],
-    valid: u8,
-}
-
-impl EvalCache {
-    fn probe_full_key(&self, key: u64) -> Option<i32> {
-        let b = &self.full_key_buckets[key as usize & self.sets_mask];
-        for w in 0..4 {
-            if b.valid & (1 << w) != 0 && b.keys[w] == key {
-                return Some(b.scores[w]);
-            }
-        }
-        None
-    }
-    fn store_full_key(&mut self, key: u64, score: i32) {
-        let b = &mut self.full_key_buckets[key as usize & self.sets_mask];
-        let w = (0..4)
-            .find(|&w| b.valid & (1 << w) == 0 || b.keys[w] == key)
-            .unwrap_or((key >> 32) as usize & 3);
-        b.keys[w] = key;
-        b.scores[w] = score;
-        b.valid |= 1 << w;
-    }
-}
-
-#[derive(Clone, Debug)]
-struct TaggedEvalBucket {
-    tags: [u64; 4],
-    scores: [i32; 4],
 }
 
 #[cfg(test)]

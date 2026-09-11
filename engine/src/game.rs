@@ -1,22 +1,97 @@
 use crate::MAX_GAME_TURNS;
-use crate::api::{
-    GameResultDto, MoveCandidateDto, MoveStackEntryDto, SearchResultDto, SessionDto, StatusDto,
-    reverse_move,
-};
 use crate::board::{CellId, Color, Coord, Direction, Move, Position, geometry};
-use crate::movegen::PositionState;
+use crate::dto::{
+    GameResultDto, MoveCandidateDto, MoveStackEntryDto, SearchResultDto, SessionDto, StatusDto,
+};
+use crate::movegen::{
+    PositionState, move_front_cell, move_group_axis, move_is_inline, neighbor_cell, reverse_move,
+};
 use crate::search::{
-    SearchResult, move_front_cell, move_group_axis, move_is_inline, neighbor_cell,
-    search_fixed_depth_with_turn, search_timed_depth_with_turn, search_timed_with_turn,
+    SearchResult, search_fixed_depth_with_turn, search_timed_depth_with_turn,
+    search_timed_with_turn,
 };
 use std::str::FromStr;
 
 pub const START_POSITION: &str = "ss1SS/sssSSS/1ss1SS1/8/9/8/1SS1ss1/SSSsss/SS1ss 0 0 b 0 0";
 
+/// Construct an edited/imported session and adjudicate it using the same rules
+/// as an ordinary played move. History intentionally starts empty.
+pub fn session_from_position_state(fen: &str, turn_index: u16) -> Result<SessionState, String> {
+    let position = parse_position(fen)?;
+    let result = detect_result(&position, &[], turn_index);
+    let mut session = SessionState::from_position(position, result);
+    session.turn_index = turn_index;
+    Ok(session)
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    fn played_session(plies: usize) -> SessionState {
+        let mut session = SessionState::new();
+        for _ in 0..plies {
+            let state = PositionState::new(*session.position()).unwrap();
+            let candidate = state.generate_legal_moves()[0];
+            session = apply_move_state(session, &candidate.to_string()).unwrap();
+        }
+        session
+    }
+
+    #[test]
+    fn compact_and_legacy_undo_roundtrip_identically() {
+        let session = played_session(4);
+        let dto = session.to_dto();
+        assert!(
+            dto.move_stack
+                .iter()
+                .all(|entry| entry.history_positions.is_empty())
+        );
+        let mut legacy = dto.clone();
+        for entry in &mut legacy.move_stack {
+            let len = entry.history_len.take().unwrap();
+            entry.history_positions = legacy.history_positions[..len].to_vec();
+        }
+        let compact_session = SessionState::try_from(dto).unwrap();
+        let legacy_session = SessionState::try_from(legacy).unwrap();
+        assert_eq!(compact_session.to_dto(), legacy_session.to_dto());
+        let compact = undo_full_turn_state(compact_session).unwrap();
+        let legacy = undo_full_turn_state(legacy_session).unwrap();
+        assert_eq!(compact.to_dto(), legacy.to_dto());
+        assert_eq!(compact.to_dto(), played_session(2).to_dto());
+    }
+
+    #[test]
+    fn invalid_undo_history_is_rejected() {
+        let mut dto = played_session(2).to_dto();
+        dto.move_stack[0].history_len = Some(100);
+        assert!(SessionState::try_from(dto).is_err());
+        let mut dto = played_session(3).to_dto();
+        dto.move_stack[0].history_len = Some(2);
+        assert!(SessionState::try_from(dto).is_err());
+    }
+
+    #[test]
+    fn edited_sessions_use_played_game_adjudication() {
+        for turn in [0, MAX_GAME_TURNS] {
+            let session = session_from_position_state(START_POSITION, turn).unwrap();
+            assert_eq!(session.result, detect_result(session.position(), &[], turn));
+            assert_eq!(session.turn_index, turn);
+        }
+        assert!(session_from_position_state("invalid", 0).is_err());
+    }
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct MoveStackEntry {
     position: Position,
-    history_positions: Vec<Position>,
+    history_len: usize,
     no_progress_ply: u16,
     turn_index: u16,
     last_engine_reverse_move: Option<Move>,
@@ -123,8 +198,8 @@ impl SessionState {
 impl MoveStackEntry {
     fn from_state(state: &SessionState) -> Self {
         Self {
-            position: state.position.clone(),
-            history_positions: state.history_positions.clone(),
+            position: state.position,
+            history_len: state.history_positions.len(),
             no_progress_ply: state.no_progress_ply,
             turn_index: state.turn_index,
             last_engine_reverse_move: state.last_engine_reverse_move,
@@ -136,11 +211,8 @@ impl MoveStackEntry {
     fn to_dto(&self) -> MoveStackEntryDto {
         MoveStackEntryDto {
             position: self.position.canonical_string(),
-            history_positions: self
-                .history_positions
-                .iter()
-                .map(Position::canonical_string)
-                .collect(),
+            history_positions: Vec::new(),
+            history_len: Some(self.history_len),
             no_progress_ply: self.no_progress_ply,
             turn_index: self.turn_index,
             last_engine_reverse_move: self
@@ -154,17 +226,25 @@ impl MoveStackEntry {
     }
 }
 
-impl TryFrom<MoveStackEntryDto> for MoveStackEntry {
-    type Error = String;
-
-    fn try_from(value: MoveStackEntryDto) -> Result<Self, Self::Error> {
+impl MoveStackEntry {
+    fn from_dto(value: MoveStackEntryDto, history: &[Position]) -> Result<Self, String> {
+        let history_len = value.history_len.unwrap_or(value.history_positions.len());
+        if history_len > history.len() {
+            return Err("undo history length exceeds session history".to_owned());
+        }
+        if value.history_len.is_none() || !value.history_positions.is_empty() {
+            let legacy = value
+                .history_positions
+                .iter()
+                .map(|p| parse_position(p))
+                .collect::<Result<Vec<_>, _>>()?;
+            if legacy != history[..history_len] {
+                return Err("undo history is not a prefix of session history".to_owned());
+            }
+        }
         Ok(Self {
             position: parse_position(&value.position)?,
-            history_positions: value
-                .history_positions
-                .into_iter()
-                .map(|position| parse_position(&position))
-                .collect::<Result<Vec<_>, _>>()?,
+            history_len,
             no_progress_ply: value.no_progress_ply,
             turn_index: value.turn_index,
             last_engine_reverse_move: value
@@ -182,13 +262,25 @@ impl TryFrom<SessionDto> for SessionState {
     type Error = String;
 
     fn try_from(value: SessionDto) -> Result<Self, Self::Error> {
+        let history_positions = value
+            .history_positions
+            .iter()
+            .map(|position| parse_position(position))
+            .collect::<Result<Vec<_>, _>>()?;
+        let move_stack = value
+            .move_stack
+            .into_iter()
+            .map(|entry| MoveStackEntry::from_dto(entry, &history_positions))
+            .collect::<Result<Vec<_>, _>>()?;
+        if move_stack
+            .windows(2)
+            .any(|pair| pair[0].history_len > pair[1].history_len)
+        {
+            return Err("undo history lengths must be nondecreasing".to_owned());
+        }
         Ok(Self {
             position: parse_position(&value.position)?,
-            history_positions: value
-                .history_positions
-                .into_iter()
-                .map(|position| parse_position(&position))
-                .collect::<Result<Vec<_>, _>>()?,
+            history_positions,
             no_progress_ply: value.no_progress_ply,
             turn_index: value.turn_index,
             last_engine_reverse_move: value
@@ -196,11 +288,7 @@ impl TryFrom<SessionDto> for SessionState {
                 .as_deref()
                 .map(parse_move)
                 .transpose()?,
-            move_stack: value
-                .move_stack
-                .into_iter()
-                .map(MoveStackEntry::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
+            move_stack,
             last_move: value.last_move.as_deref().map(parse_move).transpose()?,
             result: value.result,
         })
@@ -433,8 +521,8 @@ pub fn legal_moves_for_selection_state(
 
     let selected = parse_cells(selected_ids)?;
     let sorted = validate_selection(&session.position, &selected)?;
-    let position_state = PositionState::new(session.position.clone())
-        .map_err(|_| "invalid session position".to_owned())?;
+    let position_state =
+        PositionState::new(session.position).map_err(|_| "invalid session position".to_owned())?;
     let show_moves_for_any_group_with_cell = sorted.len() == 1;
     let selected_cell = sorted[0];
     let mut moves = position_state
@@ -465,8 +553,8 @@ pub fn apply_move_state(
 
     let candidate_move = parse_move(move_text)?;
     let side = session.position.side_to_move();
-    let mut position_state = PositionState::new(session.position.clone())
-        .map_err(|_| "invalid session position".to_owned())?;
+    let mut position_state =
+        PositionState::new(session.position).map_err(|_| "invalid session position".to_owned())?;
     let move_entry = position_state
         .legal_move_entry(&candidate_move)
         .ok_or_else(|| "illegal move for current position".to_owned())?;
@@ -477,7 +565,7 @@ pub fn apply_move_state(
         .map_err(|_| "failed to apply move".to_owned())?;
 
     session.move_stack.push(snapshot);
-    session.history_positions.push(session.position.clone());
+    session.history_positions.push(session.position);
     session.position = canonicalize_position(position_state.position())?;
     session.no_progress_ply = if move_entry.is_ejection {
         0
@@ -500,7 +588,7 @@ pub fn apply_move_state(
 
 fn restore_snapshot(session: &mut SessionState, snapshot: MoveStackEntry) {
     session.position = snapshot.position;
-    session.history_positions = snapshot.history_positions;
+    session.history_positions.truncate(snapshot.history_len);
     session.no_progress_ply = snapshot.no_progress_ply;
     session.turn_index = snapshot.turn_index;
     session.last_engine_reverse_move = snapshot.last_engine_reverse_move;

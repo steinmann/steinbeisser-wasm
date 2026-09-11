@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import math
@@ -30,9 +29,10 @@ from fit import (
     dataset_cache_format,
     dataset_cache_mmap_mode,
     read_json,
-    trainer_main,
+    training_config_from_env,
     write_json,
 )
+from run_identity import implementation_manifest, preserve_manifest
 
 
 @dataclass(frozen=True)
@@ -195,6 +195,7 @@ class RunState:
             "source_bin": self.source_bin,
             "train_samples": self.train_samples,
             "reference_ref": self.reference_ref,
+            "reference_commit": REFERENCE_COMMIT,
             "run_signature": self.run_signature,
             "screened_candidates": self.screened_candidates,
             "ranking_completed": self.ranking_completed,
@@ -1919,9 +1920,35 @@ def resolve_reference_ref() -> str:
 
 def configure_release_ref() -> None:
     global REFERENCE_REF, REFERENCE_COMMIT, REFERENCE_BIN
-    REFERENCE_REF = resolve_reference_ref()
+    saved = read_json(STATE_PATH) if STATE_PATH.is_file() else None
+    manifest = read_json(RUN_ROOT / "implementation-manifest.json")
+    if saved is not None and not isinstance(saved, dict):
+        raise SystemExit(f"{STATE_PATH} must contain a JSON object")
+    if manifest is not None and not isinstance(manifest, dict):
+        raise SystemExit("saved implementation manifest must contain a JSON object")
+    # The manifest is published before setup and the first cycle; it pins even
+    # a run interrupted before state.json was written (or with only last_error).
+    identities = []
+    for record in (saved, manifest):
+        if not record or not record.get("reference_ref"):
+            continue
+        signature = record.get("run_signature")
+        signature = signature if isinstance(signature, dict) else {}
+        commit = record.get("reference_commit") or signature.get("reference_commit")
+        if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit):
+            raise SystemExit("saved run has no immutable reference commit; recover its manifest before resuming")
+        identities.append((str(record["reference_ref"]), commit.lower()))
+    if identities:
+        if len(set(identities)) != 1:
+            raise SystemExit("saved training state and implementation manifest disagree on the reference")
+        REFERENCE_REF, reference = identities[0]
+    else:
+        if saved and int(saved.get("cycle", 0)) > 0:
+            raise SystemExit("saved training state has no release reference; refusing to select a new release")
+        REFERENCE_REF = resolve_reference_ref()
+        reference = REFERENCE_REF
     resolved = subprocess.run(
-        ["git", "-C", REPO, "rev-parse", f"{REFERENCE_REF}^{{commit}}"],
+        ["git", "-C", REPO, "rev-parse", f"{reference}^{{commit}}"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -1932,6 +1959,8 @@ def configure_release_ref() -> None:
             f"failed to resolve release tag {REFERENCE_REF}: {resolved.stderr.strip()}"
         )
     REFERENCE_COMMIT = resolved.stdout.strip()
+    if identities and REFERENCE_COMMIT.lower() != reference:
+        raise SystemExit("resolved reference does not match the saved immutable commit")
     REFERENCE_BIN = BIN_DIR / f"steinbeisser_{slug(REFERENCE_REF)}{EXE_SUFFIX}"
     configure_training_dirs()
 
@@ -2069,22 +2098,18 @@ def single_core_env() -> dict[str, str]:
 
 
 def run_trainer(env: dict[str, str]) -> None:
+    # JAX/thread settings and stream redirection belong to an isolated child,
+    # never to the parent concurrently running the data generator.
+    config = training_config_from_env(env)
+    config_path = Path(config.output_dir) / "training-config.json"
+    write_json(config_path, asdict(config))
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    old_env = os.environ.copy()
     with LOG_PATH.open("a", encoding="utf-8", buffering=1) as log:
-        log.write("$ embedded nnue trainer\n")
-        try:
-            os.environ.clear()
-            os.environ.update(env)
-            with redirect_stdout(log), redirect_stderr(log):
-                trainer_main([])
-        except SystemExit as error:
-            code = error.code
-            if code not in (None, 0):
-                raise SystemExit(f"embedded trainer failed with status {code}; see {LOG_PATH}") from error
-        finally:
-            os.environ.clear()
-            os.environ.update(old_env)
+        command = [sys.executable, str(NNUE_MODULE_DIR / "fit.py"), "--config", str(config_path)]
+        log.write("$ " + command_text(command) + "\n")
+        result = subprocess.run(command, env=dict(env), stdout=log, stderr=subprocess.STDOUT, check=False)
+    if result.returncode:
+        raise SystemExit(f"trainer failed with status {result.returncode}; see {LOG_PATH}")
 
 
 def cargo_env() -> dict[str, str]:
@@ -2210,7 +2235,7 @@ def setup() -> None:
             "--repo",
             REPO,
             "--github-ref",
-            REFERENCE_REF,
+            REFERENCE_COMMIT,
             "--github-bin",
             REFERENCE_BIN,
         ],
@@ -2499,7 +2524,7 @@ def build_reference_net_engine(cycle: int, model: Path, rank: int = 1) -> Path:
             "--repo",
             REPO,
             "--reference-ref",
-            REFERENCE_REF,
+            REFERENCE_COMMIT,
             "--model",
             model,
             "--source-dir",
@@ -2614,7 +2639,7 @@ def run_selfplay_match(
 
 def load_state() -> RunState:
     state = RunState.load()
-    if state.cycle <= 0:
+    if state.cycle <= 0 and state.run_signature is None:
         return state
     expected = current_run_signature()
     if state.run_signature is None:
@@ -3881,7 +3906,7 @@ def export_positive_training_data(
             "--corpus-dir",
             final_corpus_dir(state),
             "--reference-ref",
-            REFERENCE_REF,
+            REFERENCE_COMMIT,
         ],
         label="rust export-positive-training-data",
     )
@@ -4278,6 +4303,12 @@ def main(argv: list[str]) -> int:
         f"resume_train_samples={state.train_samples} "
         f"screened_candidates={len(state.screened_candidates)}"
     )
+    preserve_manifest(RUN_ROOT / "implementation-manifest.json",
+                      implementation_manifest(REPO, REFERENCE_REF, REFERENCE_COMMIT),
+                      require_existing=state.cycle > 0)
+    if state.run_signature is None:
+        state.run_signature = current_run_signature()
+    state.save()
     setup()
 
     generator = ContinuousGenerator(REFERENCE_BIN, GENERATOR_CONFIG, emit_status, command_text)

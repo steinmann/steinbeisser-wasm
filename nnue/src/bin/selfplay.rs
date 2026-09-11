@@ -1,21 +1,11 @@
-#[allow(dead_code, hidden_glob_reexports, private_interfaces)]
-#[path = "../../../engine/src/board.rs"]
-mod board;
-#[allow(dead_code, hidden_glob_reexports, private_interfaces)]
-#[path = "../../../engine/src/eval.rs"]
-mod eval;
 #[allow(dead_code)]
 #[path = "../materialize.rs"]
 mod materialize;
-#[allow(dead_code, hidden_glob_reexports, private_interfaces)]
-#[path = "../../../engine/src/movegen.rs"]
-mod movegen;
+#[path = "../match_protocol.rs"]
+mod protocol;
 #[allow(dead_code)]
 #[path = "../sample.rs"]
 mod sample;
-#[allow(dead_code, hidden_glob_reexports, private_interfaces)]
-#[path = "../../../engine/src/search.rs"]
-mod search;
 
 use std::env;
 use std::fs::{self, File};
@@ -30,10 +20,8 @@ use std::sync::{
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use board::{Color, Move, Position};
-use movegen::PositionState;
 use sample::BinarySample;
-use search::MAX_GAME_TURNS;
+use steinbeisser::{Color, MAX_GAME_TURNS, Move, Position, PositionState};
 
 const MAX_PIECES: usize = Position::MAX_PIECES_PER_SIDE;
 const WIN_SCORE: usize = 6;
@@ -568,6 +556,11 @@ fn run_match(args: &Args) -> Result<(), String> {
                 }
             }
             Err(_) => {
+                protocol::emit(&protocol::MatchEvent::Failure {
+                    actor: None,
+                    kind: "worker_panic".to_owned(),
+                    message: "match worker panicked".to_owned(),
+                });
                 if worker_error.is_none() {
                     worker_error = Some("match worker panicked".to_owned());
                 }
@@ -711,6 +704,19 @@ fn print_summary(
     println!();
     print_engine("github", github);
     print_engine("local", local);
+    protocol::emit(&protocol::MatchEvent::Complete {
+        games: summary.games,
+        wins: summary.local_wins,
+        draws: summary.draws,
+        losses: summary.github_wins,
+        elo: summary.elo,
+        elo_lower: summary.ci_low,
+        elo_upper: summary.ci_high,
+        local_illegal: local.illegal,
+        local_errors: local.errors,
+        github_illegal: github.illegal,
+        github_errors: github.errors,
+    });
 }
 
 fn print_engine(name: &str, stats: &EngineStats) {
@@ -993,15 +999,17 @@ impl EngineProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+            .map_err(|error| {
+                protocol::engine_error(name, "spawn", format!("{}: {error}", path.display()))
+            })?;
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| "missing engine stdin".to_owned())?;
+            .ok_or_else(|| protocol::engine_error(name, "spawn", "missing engine stdin"))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| "missing engine stdout".to_owned())?;
+            .ok_or_else(|| protocol::engine_error(name, "spawn", "missing engine stdout"))?;
         Ok(Self {
             name,
             child,
@@ -1018,21 +1026,25 @@ impl EngineProcess {
             .and_then(|_| self.stdin.flush())
             .map_err(|error| {
                 self.stats.errors += 1;
-                format!("{} write failed: {error}", self.name)
+                protocol::engine_error(self.name, "write", error)
             })?;
 
         let mut line = String::new();
         let read = self.stdout.read_line(&mut line).map_err(|error| {
             self.stats.errors += 1;
-            format!("{} read failed: {error}", self.name)
+            protocol::engine_error(self.name, "read", error)
         })?;
         if read == 0 {
             self.stats.errors += 1;
-            return Err(format!("{} exited", self.name));
+            return Err(protocol::engine_error(
+                self.name,
+                "exit",
+                "engine stdout closed",
+            ));
         }
         let reply = parse_reply(&line, start.elapsed().as_millis()).map_err(|error| {
             self.stats.errors += 1;
-            format!("{} bad reply: {error}", self.name)
+            protocol::engine_error(self.name, "reply", error)
         })?;
         self.stats.record(&reply);
         Ok(reply)
@@ -1111,10 +1123,7 @@ fn play_game(
         let reply = engine_for(first, second, engine_id).search(&before, limits)?;
         adjudicate(&before, &reply).map_err(|error| {
             engine_for(first, second, engine_id).stats.illegal += 1;
-            format!(
-                "illegal engine reply from {}: {error}",
-                engine_name(engine_id)
-            )
+            protocol::engine_error(engine_name(engine_id), "illegal", error)
         })?;
 
         if keep_training_row(&reply, max_abs_score) {
@@ -1222,7 +1231,7 @@ fn adjudicate(before: &GameState, reply: &EngineReply) -> Result<Move, String> {
     if let Some(best_move) = &reply.best_move {
         let candidate_move = Move::from_str(best_move).map_err(|error| format!("{error}"))?;
         let mut state =
-            PositionState::new(before.position.clone()).map_err(|error| format!("{error:?}"))?;
+            PositionState::new(before.position).map_err(|error| format!("{error:?}"))?;
         state
             .apply_move(&candidate_move)
             .map_err(|error| format!("{error:?}"))?;
@@ -1232,10 +1241,9 @@ fn adjudicate(before: &GameState, reply: &EngineReply) -> Result<Move, String> {
         return Err("reported move does not produce reported position".to_owned());
     }
 
-    let state =
-        PositionState::new(before.position.clone()).map_err(|error| format!("{error:?}"))?;
+    let state = PositionState::new(before.position).map_err(|error| format!("{error:?}"))?;
     for candidate_move in state.generate_legal_moves() {
-        let mut next = state.clone();
+        let mut next = state;
         next.apply_move(&candidate_move)
             .map_err(|error| format!("{error:?}"))?;
         if canonical_position(next.position())? == after.position {

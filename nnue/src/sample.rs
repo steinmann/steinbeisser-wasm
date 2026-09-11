@@ -61,6 +61,7 @@ pub fn write_samples(path: &Path, samples: &[BinarySample]) -> io::Result<()> {
 }
 
 pub fn read_samples(path: &Path) -> io::Result<Vec<BinarySample>> {
+    sample_count(path)?;
     let mut reader = BufReader::new(fs::File::open(path)?);
     let mut magic = [0_u8; MAGIC.len()];
     reader.read_exact(&mut magic)?;
@@ -153,11 +154,18 @@ fn read_record(reader: &mut impl Read) -> io::Result<Option<BinarySample>> {
 
 fn read_u64_or_eof(reader: &mut impl Read) -> io::Result<Option<u64>> {
     let mut bytes = [0_u8; 8];
-    match reader.read_exact(&mut bytes) {
-        Ok(()) => Ok(Some(u64::from_le_bytes(bytes))),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
-        Err(error) => Err(error),
+    // Only EOF before the first byte is a clean boundary. read_exact alone
+    // cannot distinguish that from a truncated first field of the next row.
+    loop {
+        match reader.read(&mut bytes[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
     }
+    reader.read_exact(&mut bytes[1..])?;
+    Ok(Some(u64::from_le_bytes(bytes)))
 }
 
 fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
@@ -188,4 +196,24 @@ fn read_u8(reader: &mut impl Read) -> io::Result<u8> {
     let mut bytes = [0_u8; 1];
     reader.read_exact(&mut bytes)?;
     Ok(bytes[0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eof_is_clean_only_between_complete_records() {
+        assert!(read_record(&mut &[][..]).unwrap().is_none());
+        let complete = [0_u8; RECORD_BYTES as usize];
+        for length in 1..complete.len() {
+            let error = read_record(&mut &complete[..length]).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof,
+                "length {length}"
+            );
+        }
+        assert!(read_record(&mut &complete[..]).unwrap().is_some());
+    }
 }

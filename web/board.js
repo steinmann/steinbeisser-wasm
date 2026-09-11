@@ -39,7 +39,6 @@ const COLUMN_STEP = 157;
 const CAPTURE_XS = [537.5, 694.5, 851.5, 1008.5, 1165.5, 1322.5];
 const BLACK_CAPTURE_Y = -20;
 const WHITE_CAPTURE_Y = 1490;
-const MAX_MARBLES_PER_SIDE = 14;
 
 const DIRECTION_AXIAL = {
   E: [1, 0],
@@ -159,7 +158,7 @@ export function parsePositionString(position) {
   const white = new Set();
   for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
     const rowCells = CELLS.filter((cell) => cell.rowIndex === rowIndex);
-    const expanded = expandFenRow(rows[rowIndex]);
+    const expanded = expandFenRow(rows[rowIndex], rowCells.length);
     if (expanded.length !== rowCells.length) {
       throw new Error(`FEN row ${rowIndex + 1} has ${expanded.length} cells, expected ${rowCells.length}`);
     }
@@ -180,7 +179,7 @@ export function parsePositionString(position) {
   return { sideToMove, black, white };
 }
 
-function expandFenRow(rawRow) {
+function expandFenRow(rawRow, width) {
   const expanded = [];
   let index = 0;
   while (index < rawRow.length) {
@@ -193,7 +192,7 @@ function expandFenRow(rawRow) {
         index += 1;
       }
       const emptyCount = Number.parseInt(digits, 10);
-      if (emptyCount <= 0) {
+      if (!Number.isSafeInteger(emptyCount) || emptyCount <= 0 || emptyCount > width - expanded.length) {
         throw new Error(`Unsupported FEN empty count "${digits}"`);
       }
       for (let count = emptyCount; count > 0; count -= 1) {
@@ -202,6 +201,7 @@ function expandFenRow(rawRow) {
       continue;
     }
     if (char === 's' || char === 'S') {
+      if (expanded.length >= width) throw new Error('FEN row exceeds board width');
       expanded.push(char === 'S' ? 'black' : 'white');
       index += 1;
       continue;
@@ -425,9 +425,9 @@ function appendPieces(group, positionState, editMode, onDragStart) {
   }
 }
 
-function appendCapturedPieces(group, session, editMode, onDragStart) {
-  const missingBlack = Math.max(0, MAX_MARBLES_PER_SIDE - (session.blackCount ?? MAX_MARBLES_PER_SIDE));
-  const missingWhite = Math.max(0, MAX_MARBLES_PER_SIDE - (session.whiteCount ?? MAX_MARBLES_PER_SIDE));
+function appendCapturedPieces(group, session, editMode, onDragStart, maxMarblesPerSide) {
+  const missingBlack = Math.max(0, maxMarblesPerSide - (session.blackCount ?? maxMarblesPerSide));
+  const missingWhite = Math.max(0, maxMarblesPerSide - (session.whiteCount ?? maxMarblesPerSide));
 
   const whiteCaptureXs = CAPTURE_XS.slice(0, missingWhite);
   const blackCaptureXs = CAPTURE_XS.slice(CAPTURE_XS.length - missingBlack);
@@ -590,6 +590,7 @@ export function renderBoard({
   locked,
   editMode = false,
   onEditDrop = () => {},
+  maxMarblesPerSide,
 }) {
   container.textContent = '';
   const positionState = parsePositionString(session.position);
@@ -618,7 +619,7 @@ export function renderBoard({
   const dragLayer = svg('g');
 
   const beginEditDrag = (event, payload) => {
-    if (!editMode || event.button !== 0) {
+    if (!editMode || drag || event.button !== 0) {
       return;
     }
     event.preventDefault();
@@ -664,13 +665,23 @@ export function renderBoard({
     onEditDrop(payload, targetCell?.coord ?? null);
   };
 
+  const cancelEditDrag = (event) => {
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    drag.ghost.remove();
+    drag = null;
+    if (svgRoot.hasPointerCapture(event.pointerId)) {
+      svgRoot.releasePointerCapture(event.pointerId);
+    }
+  };
+
   if (editMode) {
     svgRoot.addEventListener('pointermove', moveEditDrag);
     svgRoot.addEventListener('pointerup', finishEditDrag);
-    svgRoot.addEventListener('pointercancel', finishEditDrag);
+    svgRoot.addEventListener('pointercancel', cancelEditDrag);
+    svgRoot.addEventListener('lostpointercapture', cancelEditDrag);
   }
 
-  appendCapturedPieces(capturedPieces, session, editMode, beginEditDrag);
+  appendCapturedPieces(capturedPieces, session, editMode, beginEditDrag, maxMarblesPerSide);
   svgRoot.append(capturedPieces);
 
   svgRoot.append(

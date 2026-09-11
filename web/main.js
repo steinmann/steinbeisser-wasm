@@ -4,12 +4,15 @@ const workerModulePath = `./worker.js${buildId}`;
 
 const engineModule = await import(`./pkg/steinbeisser.js${buildId}`);
 const boardModule = await import(`./board.js${buildId}`);
+const { SearchWorkerClient } = await import(`./worker-client.js${buildId}`);
 
 const {
   default: initEngine,
   apply_move,
   legal_moves_for_selection,
   new_session,
+  session_from_position,
+  max_marbles_per_side,
   session_status,
   undo_full_turn,
 } = engineModule;
@@ -23,6 +26,8 @@ const {
   renderBoard,
 } = boardModule;
 
+await initEngine({ module_or_path: wasmModulePath });
+
 const DEFAULT_MAX_DEPTH = 17;
 const DEFAULT_MAX_TIME_SECONDS = 3;
 const MIN_MAX_DEPTH = 1;
@@ -31,7 +36,7 @@ const MIN_MAX_TIME_SECONDS = 0.1;
 const MAX_MAX_TIME_SECONDS = 600;
 const MAX_TIME_STEP_SECONDS = 0.1;
 const EVAL_EXPECTED_OUTCOME_SCORE_SCALE = 996;
-const MAX_MARBLES_PER_SIDE = 14;
+const MAX_MARBLES_PER_SIDE = max_marbles_per_side();
 
 const state = {
   session: null,
@@ -49,7 +54,6 @@ const state = {
   thinkingSide: null,
   activeSearchKind: null,
   worker: null,
-  workerReady: null,
   nextRequestId: 1,
   activeRequestId: null,
   lastEngineSearchInfo: null,
@@ -167,62 +171,8 @@ function serializePlayStrategyFen(positionState) {
   return `${rows.join('/')} 0 0 ${side} ${whiteEjected} ${blackEjected}`;
 }
 
-function editedResult(positionState, turnIndex) {
-  if (positionState.black.size <= 8) {
-    return {
-      kind: 'win',
-      winner: 'white',
-      reason: 'black_marbles_reduced_to_eight',
-    };
-  }
-  if (positionState.white.size <= 8) {
-    return {
-      kind: 'win',
-      winner: 'black',
-      reason: 'white_marbles_reduced_to_eight',
-    };
-  }
-  if (turnIndex >= 350) {
-    if (positionState.black.size > positionState.white.size) {
-      return {
-        kind: 'win',
-        winner: 'black',
-        reason: 'max_turns_material_advantage',
-      };
-    }
-    if (positionState.white.size > positionState.black.size) {
-      return {
-        kind: 'win',
-        winner: 'white',
-        reason: 'max_turns_material_advantage',
-      };
-    }
-    return {
-      kind: 'draw',
-      winner: null,
-      reason: 'max_turns_even_material',
-    };
-  }
-  return null;
-}
-
 function sessionFromPosition(position, turnIndex = 0) {
-  const positionState = parsePositionString(position);
-  const session = {
-    position,
-    sideToMove: positionState.sideToMove,
-    historyPositions: [],
-    noProgressPly: 0,
-    turnIndex,
-    lastEngineReverseMove: null,
-    moveStack: [],
-    blackCount: positionState.black.size,
-    whiteCount: positionState.white.size,
-    lastMove: null,
-    result: editedResult(positionState, turnIndex),
-  };
-  session_status(session);
-  return session;
+  return session_from_position(position, turnIndex);
 }
 
 function parsePlayStrategyFen(value) {
@@ -442,6 +392,7 @@ function render() {
     onBackgroundClick: handleBoardBackgroundClick,
     editMode: state.editMode,
     onEditDrop: handleEditDrop,
+    maxMarblesPerSide: MAX_MARBLES_PER_SIDE,
   });
 
   renderEvaluationBar(status);
@@ -638,13 +589,6 @@ async function applyHumanMove(moveText) {
 
 function handleWorkerMessage(event) {
   const message = event.data;
-  if (message.type === 'ready') {
-    if (state.workerReady?.resolve) {
-      state.workerReady.resolve();
-      state.workerReady = { promise: state.workerReady.promise, resolve: null };
-    }
-    return;
-  }
 
   if (message.type === 'result') {
     if (message.requestId !== state.activeRequestId) {
@@ -660,7 +604,12 @@ function handleWorkerMessage(event) {
       elapsedMs,
     );
     state.evaluationWhiteScore = message.result.whitePerspectiveScore;
-    state.session = apply_move(state.session, message.result.bestMove);
+    try {
+      state.session = apply_move(state.session, message.result.bestMove);
+    } catch (error) {
+      handleSearchFailure(error);
+      return;
+    }
     const statusAfterMove = session_status(state.session);
     state.lastEngineDebugInfo = {
       depth: `${message.result.depth} ply`,
@@ -690,51 +639,42 @@ function handleWorkerMessage(event) {
   }
 }
 
+function handleSearchFailure(error) {
+  setNotice(error.message || String(error), 'error');
+  state.thinking = false;
+  state.thinkingSide = null;
+  state.activeRequestId = null;
+  state.activeSearchKind = null;
+  state.demoMode = false;
+  clearSearchInfo();
+  render();
+}
+
 function createSearchWorker() {
   if (state.worker) {
     state.worker.terminate();
   }
 
-  const worker = new Worker(workerModulePath, { type: 'module' });
-  worker.addEventListener('message', handleWorkerMessage);
-  worker.addEventListener('error', (event) => {
-    setNotice(event.message || 'Worker error', 'error');
-    state.thinking = false;
-    state.thinkingSide = null;
-    state.activeRequestId = null;
-    state.activeSearchKind = null;
-    state.demoMode = false;
-    clearSearchInfo();
-    render();
-  });
-
-  let resolveReady;
-  const promise = new Promise((resolve) => {
-    resolveReady = resolve;
-  });
+  const worker = new SearchWorkerClient(workerModulePath, handleWorkerMessage, handleSearchFailure);
 
   state.worker = worker;
-  state.workerReady = { promise, resolve: resolveReady };
-  worker.postMessage({ type: 'init' });
-  return promise;
+  return worker.ready;
 }
 
-async function ensureWorkerReady() {
-  if (!state.worker) {
-    await createSearchWorker();
+function ensureWorkerReady() {
+  if (!state.worker || state.worker.status === 'failed' || state.worker.status === 'disposed') {
+    createSearchWorker();
   }
-  return state.workerReady?.promise;
+  return state.worker.ready;
 }
 
-async function cancelSearch() {
-  if (!state.worker) {
-    return;
-  }
+function cancelSearch() {
   state.activeRequestId = null;
   state.activeSearchKind = null;
   state.thinking = false;
   state.thinkingSide = null;
-  await createSearchWorker();
+  state.worker?.terminate();
+  state.worker = null;
 }
 
 async function beginEngineTurn() {
@@ -753,18 +693,23 @@ async function beginEngineTurn() {
   state.thinkingSide = status.sideToMove;
   clearNotice();
   render();
-  await ensureWorkerReady();
-  if (state.activeRequestId !== requestId || state.activeSearchKind !== 'move') {
-    return;
+  try {
+    await ensureWorkerReady();
+    if (state.activeRequestId !== requestId || state.activeSearchKind !== 'move') {
+      return;
+    }
+    state.worker.postMessage({
+      type: 'search',
+      kind: 'move',
+      requestId,
+      maxDepth,
+      maxTimeMs,
+      session: state.session,
+    });
+  } catch (error) {
+    // Cancellation invalidates the request before rejecting its readiness wait.
+    if (state.activeRequestId === requestId) handleSearchFailure(error);
   }
-  state.worker.postMessage({
-    type: 'search',
-    kind: 'move',
-    requestId,
-    maxDepth,
-    maxTimeMs,
-    session: state.session,
-  });
 }
 
 async function ensureEngineTurnIfNeeded() {
@@ -799,7 +744,7 @@ editPositionButton.addEventListener('click', async () => {
   if (!state.editMode) {
     state.demoMode = false;
     if (state.activeRequestId !== null) {
-      await cancelSearch();
+      cancelSearch();
     }
     state.editMode = true;
     clearSelection();
@@ -825,7 +770,7 @@ demoButton.addEventListener('click', async () => {
   if (state.demoMode) {
     state.demoMode = false;
     if (state.activeRequestId !== null) {
-      await cancelSearch();
+      cancelSearch();
     }
     clearSearchInfo();
     render();
@@ -847,7 +792,7 @@ toggleSideButton.addEventListener('click', async () => {
   clearTransientNotice();
   state.demoMode = false;
   if (state.activeRequestId !== null) {
-    await cancelSearch();
+    cancelSearch();
   }
   state.humanColor = engineColor();
   await resetBoardState();
@@ -900,7 +845,7 @@ takeBackButton.addEventListener('click', async () => {
   clearTransientNotice();
   try {
     if (state.activeRequestId !== null) {
-      await cancelSearch();
+      cancelSearch();
     }
     state.session = undo_full_turn(state.session);
     clearSelection();
@@ -922,7 +867,7 @@ resetButton.addEventListener('click', async () => {
   state.demoMode = false;
   state.editMode = false;
   if (state.activeRequestId !== null) {
-    await cancelSearch();
+    cancelSearch();
   }
   await resetBoardState();
 });
@@ -937,10 +882,9 @@ positionInput.addEventListener('keydown', (event) => {
 
 positionInput.addEventListener('change', applyPositionText);
 
-await initEngine({ module_or_path: wasmModulePath });
 state.session = new_session();
 initialSessionPosition = state.session.position;
-await createSearchWorker();
+createSearchWorker();
 render();
 
 window.addEventListener('resize', syncEvaluationBarGeometry);

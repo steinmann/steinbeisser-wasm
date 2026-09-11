@@ -28,6 +28,110 @@ pub(crate) fn huber_loss(error: f64) -> f64 {
 }
 
 pub const FEATURE_SET_NAME: &str = "steinbeisser_nnue_features";
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    use steinbeisser::{Color, MAX_GAME_TURNS, PositionState, diagnostics};
+
+    #[test]
+    fn python_schema_artifact_matches_rust_interface() {
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("../feature-schema.json")).unwrap();
+        assert_eq!(
+            serde_json::to_value(super::current_feature_schema()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn production_features_and_nnq_evaluation_match_training_on_legal_walks() {
+        let model = SparseMlpModel::from_nnq_bytes(&diagnostics::model_bytes()).unwrap();
+        let opening: Position = "ss1SS/sssSSS/1ss1SS1/8/9/8/1SS1ss1/SSSsss/SS1ss 0 0 b 0 0"
+            .parse()
+            .unwrap();
+        let mut state = PositionState::new(opening).unwrap();
+        let mut rng = 0x517c_c1b7_2722_0a95_u64;
+        for index in 0..1_024 {
+            if index % 128 == 0 {
+                state = PositionState::new(opening).unwrap();
+            }
+            let position = state.position();
+            let black = position.side_to_move() == Color::Black;
+            let feature_set = model.feature_set();
+            for (turn, no_progress) in [
+                (0, 0),
+                ((index % 350) as u16, (index % 64) as u16),
+                (349, 64),
+                (350, 350),
+                (u16::MAX, u16::MAX),
+            ] {
+                let production = diagnostics::evaluation_snapshot(position, turn, no_progress);
+                let normalization = model.dense_normalization();
+                assert_eq!(
+                    normalization.resolved_offsets(feature_set),
+                    production.dense_offsets
+                );
+                assert_eq!(
+                    normalization.resolved_scales(feature_set),
+                    production.dense_scales
+                );
+                let features = feature_set.feature_vector_from_bitboards_with_context(
+                    black,
+                    position.black_bits(),
+                    position.white_bits(),
+                    f32::from(turn),
+                    f32::from(no_progress),
+                    normalization,
+                );
+                assert_eq!(
+                    features.dense_values(),
+                    production.dense,
+                    "state {index}, turn {turn}"
+                );
+
+                // Include the production terminal-pressure adjustment, using
+                // independently extracted training-side shape statistics.
+                let (own, opponent) = if black {
+                    (position.black_bits(), position.white_bits())
+                } else {
+                    (position.white_bits(), position.black_bits())
+                };
+                let own_shape = analyze_side(own);
+                let opponent_shape = analyze_side(opponent);
+                let material = own.count_ones() as i32 - opponent.count_ones() as i32;
+                let edge = own_shape.edge_total - opponent_shape.edge_total;
+                let own_score = Position::MAX_PIECES_PER_SIDE as i32 - opponent.count_ones() as i32;
+                let opponent_score = Position::MAX_PIECES_PER_SIDE as i32 - own.count_ones() as i32;
+                let progress = own_score * own_score - opponent_score * opponent_score;
+                let liberties =
+                    i32::from(own_shape.liberty_count) - i32::from(opponent_shape.liberty_count);
+                let remaining = i32::from(MAX_GAME_TURNS.saturating_sub(turn)).max(1);
+                let nnue_score =
+                    (model.raw_output(&features).clamp(-1.0, 1.0) * 5_000.0).round() as i32;
+                let expected = nnue_score + material * (1_024 / remaining)
+                    - edge * (64 / remaining)
+                    + progress * (128 / remaining)
+                    + liberties * (64 / remaining);
+                assert_eq!(
+                    production.score, expected,
+                    "state {index}, turn {turn}, no-progress {no_progress}"
+                );
+            }
+            let moves = state.generate_legal_moves();
+            if moves.is_empty() {
+                state = PositionState::new(opening).unwrap();
+            } else {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                state
+                    .apply_move(&moves[rng as usize % moves.len()])
+                    .unwrap();
+            }
+        }
+    }
+}
 pub const FEATURE_SCHEMA_ROW_LENGTHS: [usize; 9] = [5, 6, 7, 8, 9, 8, 7, 6, 5];
 pub const SPARSE_FEATURE_COUNT: usize = CELL_COUNT * 2;
 pub const MAX_ACTIVE_FEATURES: usize = Position::MAX_PIECES_PER_SIDE * 2;

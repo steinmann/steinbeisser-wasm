@@ -29,8 +29,12 @@ self.addEventListener('message', async (event) => {
   const message = event.data;
 
   if (message.type === 'init') {
-    await ensureEngineReady();
-    self.postMessage({ type: 'ready' });
+    try {
+      await ensureEngineReady();
+      self.postMessage({ type: 'ready' });
+    } catch (error) {
+      self.postMessage({ type: 'init-error', error: error?.message || String(error) });
+    }
     return;
   }
 
