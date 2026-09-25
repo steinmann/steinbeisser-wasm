@@ -238,6 +238,7 @@ class TrainingConfig:
     ema_decay: float | None = None
     seed: int = 1
     nnue_cli: str | None = None
+    initial_model_path: str | None = None
 
 
 @dataclass
@@ -361,6 +362,9 @@ def run_training(config: TrainingConfig) -> dict:
         weight_decay=config.weight_decay,
         ema_decay=config.ema_decay,
     )
+    if config.initial_model_path:
+        initial_state = read_quantized_runtime_model(Path(config.initial_model_path))
+        model.load_initial_state(initial_state, spec.name, normalization)
     rng = random.Random(config.seed)
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -636,6 +640,11 @@ def build_training_provenance(
         "manifest_feature_set": str(manifest.get("feature_set", "")),
         "feature_set_used": feature_set_name,
         "dataset_phase_bucket_count": manifest.get("phase_bucket_count"),
+        "initial_model_path": config.initial_model_path,
+        "initial_model_sha256": (
+            hashlib.sha256(Path(config.initial_model_path).read_bytes()).hexdigest()
+            if config.initial_model_path else None
+        ),
     }
 
 
@@ -700,6 +709,102 @@ def format_optional_loss(value: float | None) -> str:
     if value is None:
         return "n/a"
     return f"{float(value):.6f}"
+
+
+def read_quantized_runtime_model(path: Path) -> dict:
+    """Reconstruct trainer weights from a version-7 quantized runtime model."""
+    data = path.read_bytes()
+    cursor = 0
+
+    def take(fmt: str):
+        nonlocal cursor
+        size = struct.calcsize(fmt)
+        if cursor + size > len(data):
+            raise ValueError(f"truncated NNQ model: {path}")
+        values = struct.unpack_from(fmt, data, cursor)
+        cursor += size
+        return values[0] if len(values) == 1 else values
+
+    if data[:4] != NNQ_MAGIC:
+        raise ValueError(f"invalid NNQ magic: {path}")
+    cursor = 4
+    version, marker, activation, backend, transform = take("<HBBBB")
+    if (version, marker, activation, backend, transform) != (
+        NNQ_VERSION, NNUE_BOARD_RADIUS_MARKER, CLIPPED_RELU_ACTIVATION,
+        SCALAR_BACKEND_ID, TARGET_TRANSFORM_LINEAR_CLIP_V1,
+    ):
+        raise ValueError(f"unsupported NNQ format: {path}")
+    sparse_count, dense_count, hidden_count = take("<III")
+    if hidden_count not in (1, 2):
+        raise ValueError("unsupported NNQ layer count")
+    hidden = [take("<I") for _ in range(hidden_count)]
+    schema = current_feature_schema()
+    if sparse_count != schema.sparse_count or dense_count != schema.dense_count:
+        raise ValueError("NNQ feature schema does not match the current trainer")
+    architecture = [sparse_count + dense_count, *hidden, 1]
+    validate_architecture(architecture, schema.input_count)
+    sparse_scale = take("<f")
+    scale_count = take("<I")
+    if scale_count > dense_count:
+        raise ValueError("invalid NNQ dense scale count")
+    dense_scales = list(take(f"<{scale_count}f")) if scale_count else []
+    offset_count = take("<I")
+    if offset_count > dense_count:
+        raise ValueError("invalid NNQ dense offset count")
+    dense_offsets = list(take(f"<{offset_count}f")) if offset_count else []
+    output_bias = take("<f")
+    activation_scales = [take("<f") for _ in hidden]
+    first_width = hidden[0]
+    first_bias = np.asarray(take(f"<{first_width}i"), dtype=np.float32) * sparse_scale
+    sparse_weights = (
+        np.asarray(take(f"<{sparse_count * first_width}h"), dtype=np.float32)
+        .reshape(sparse_count, first_width) * sparse_scale
+    )
+    dense_weights = (
+        np.asarray(take(f"<{dense_count * first_width}f"), dtype=np.float32)
+        .reshape(dense_count, first_width)
+    )
+    state = {
+        "feature_set": schema.name,
+        "architecture": architecture,
+        "hidden_sizes": hidden,
+        "input_count": architecture[0],
+        "input_count_sparse": sparse_count,
+        "input_count_dense": dense_count,
+        "dense_feature_scales": dense_scales,
+        "dense_feature_offsets": dense_offsets,
+        "activation": "relu",
+        "target_transform": "linear_clip_v1",
+        "runtime_activation_scales": activation_scales,
+        "w1_sparse": sparse_weights.tolist(),
+        "w1_dense": dense_weights.tolist(),
+        "b1": first_bias.tolist(),
+    }
+    previous_width = first_width
+    for layer_number, output_width in enumerate(hidden[1:], start=2):
+        padded_width, weight_scale = take("<If")
+        if padded_width < previous_width or padded_width > previous_width + 64:
+            raise ValueError("invalid NNQ padded width")
+        biases = take(f"<{output_width}f")
+        quantized = np.asarray(
+            take(f"<{padded_width * output_width}b"), dtype=np.float32
+        ).reshape(output_width, padded_width)
+        state[f"w{layer_number}"] = (
+            quantized[:, :previous_width].T * weight_scale
+        ).tolist()
+        state[f"b{layer_number}"] = list(biases)
+        previous_width = output_width
+    padded_width, weight_scale = take("<If")
+    if padded_width < previous_width or padded_width > previous_width + 64:
+        raise ValueError("invalid NNQ output width")
+    output_weights = np.asarray(take(f"<{padded_width}b"), dtype=np.float32)
+    state[f"w{hidden_count + 1}"] = (
+        output_weights[:previous_width] * weight_scale
+    ).tolist()
+    state[f"b{hidden_count + 1}"] = output_bias
+    if cursor != len(data):
+        raise ValueError("NNQ model contains trailing bytes")
+    return state
 
 
 def write_quantized_runtime_model(state: dict, path: Path) -> None:
@@ -1815,6 +1920,25 @@ class JaxMlpModel:
         outputs = self._predict_fn(weights, biases, inputs_array)
         return np.asarray(jax.device_get(outputs), dtype=np.float32).tolist()
 
+    def load_initial_state(self, state: dict, feature_set: str, normalization: dict) -> None:
+        if state["feature_set"] != feature_set or state["architecture"] != self.architecture:
+            raise ValueError("initial NNQ model does not match training architecture")
+        if load_dense_normalization(state) != load_dense_normalization(normalization):
+            raise ValueError("initial NNQ normalization differs from the training corpus")
+        weights, biases = state_layers_to_python(
+            state, self.architecture, self.sparse_input_count, self.dense_input_count
+        )
+        self.weights = tuple(jnp.asarray(weight, dtype=jnp.float32) for weight in weights)
+        self.biases = tuple(jnp.asarray(bias, dtype=jnp.float32) for bias in biases)
+        self.m_weights = tuple(jnp.zeros_like(weight) for weight in self.weights)
+        self.v_weights = tuple(jnp.zeros_like(weight) for weight in self.weights)
+        self.m_biases = tuple(jnp.zeros_like(bias) for bias in self.biases)
+        self.v_biases = tuple(jnp.zeros_like(bias) for bias in self.biases)
+        if self.ema_decay is not None:
+            self.ema_weights = tuple(jnp.array(weight) for weight in self.weights)
+            self.ema_biases = tuple(jnp.array(bias) for bias in self.biases)
+        self.step = 0
+
     def train_batch(self, inputs, targets, weights, learning_rate: float) -> float:
         inputs_array = jnp.asarray(inputs, dtype=jnp.float32)
         loss, new_weights, new_biases, new_m_weights, new_v_weights, new_m_biases, new_v_biases = self._train_step_fn(
@@ -2151,8 +2275,8 @@ def training_config_from_env(env: dict[str, str]) -> TrainingConfig:
             env_int("STEINBEISSER_LOADER_WORKERS", 1),
         ),
         dataset_cache_dir=required_env("STEINBEISSER_NNUE_DATASET_CACHE_DIR"),
-        learning_rate=0.0019,
-        min_learning_rate=0.00003,
+        learning_rate=float(env.get("STEINBEISSER_NNUE_LEARNING_RATE", "0.0019")),
+        min_learning_rate=float(env.get("STEINBEISSER_NNUE_MIN_LEARNING_RATE", "0.00003")),
         weight_decay=0.0007,
         warmup_epochs=5,
         patience=env_int("STEINBEISSER_NNUE_PATIENCE", 20),
@@ -2160,6 +2284,7 @@ def training_config_from_env(env: dict[str, str]) -> TrainingConfig:
         runtime_loss_interval=1,
         ema_decay=0.9999,
         nnue_cli=required_env("STEINBEISSER_NNUE_CLI"),
+        initial_model_path=env.get("STEINBEISSER_NNUE_INITIAL_MODEL"),
     )
 
 

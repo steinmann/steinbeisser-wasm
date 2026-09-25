@@ -24,6 +24,40 @@ def trainer_env(output="output"):
 
 
 class TrainingInterfaces(unittest.TestCase):
+    def test_screen_match_rejects_forfeit_even_with_complete_wdl(self):
+        payload = {
+            "wins": 0, "draws": 1000, "losses": 0,
+            "elo": 0.0, "elo_lower": -1.0, "elo_upper": 1.0,
+            "forfeit": True,
+        }
+        with patch.object(train, "run_json_command", return_value=payload):
+            with self.assertRaisesRegex(SystemExit, "forfeit"):
+                train.run_selfplay_match(Path("candidate"), Path("baseline"))
+
+    def test_v27_finish_uses_random_only_qualification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = train.RunState(screened_candidates=[{"id": "screened"}])
+            summary = {
+                "winner": "candidate-1",
+                "standings": [{
+                    "player": "candidate-1", "elo_vs_release": 2.0,
+                    "games": 7500, "wins": 20, "draws": 7470, "losses": 10,
+                }],
+                "release_gate": {
+                    "games": 10000, "wins": 30, "draws": 9950,
+                    "losses": 20, "elo": 0.3, "elo_95_ci": "0.1,0.5",
+                },
+                "release_gate_passed": True,
+            }
+            with patch.object(train, "WORK_DIR", root), patch.object(train, "RUN_ROOT", root), patch.object(train, "prepare_tournament_openings", return_value=(root / "tournament.fen", [])) as tournament, patch.object(train, "load_unique_book_openings", return_value=["fen"] * 5000) as openings, patch("nnue.general_qualify.qualify", return_value=summary) as qualify, patch.object(state, "save"), patch.object(train, "emit_tournament_table"), patch.object(train, "emit"):
+                train.finish_training(state)
+            tournament.assert_called_once_with(train.OPENING_CONFIG, 250)
+            self.assertEqual(openings.call_args.kwargs["skip"], 750)
+            self.assertEqual(qualify.call_args.kwargs["tournament_openings"], root / "tournament.fen")
+            self.assertTrue(state.tournament_completed)
+            self.assertTrue(state.tournament_summary["release_gate_passed"])
+
     def test_config_is_explicit_and_roundtrips(self):
         before = dict(os.environ)
         config = fit.training_config_from_env(trainer_env())

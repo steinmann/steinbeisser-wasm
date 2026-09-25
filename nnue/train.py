@@ -23,6 +23,8 @@ from typing import Callable
 NNUE_MODULE_DIR = Path(__file__).resolve().parent
 if str(NNUE_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(NNUE_MODULE_DIR))
+if str(NNUE_MODULE_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(NNUE_MODULE_DIR.parent))
 
 from fit import (
     current_feature_schema,
@@ -534,6 +536,8 @@ def tournament_table_lines(standings: list[dict[str, object]]) -> list[str]:
         "Games",
         "Score",
         "WDL",
+        "Avg depth",
+        "NPS",
         "Screen Elo",
         "QVal",
     ]
@@ -549,6 +553,8 @@ def tournament_table_lines(standings: list[dict[str, object]]) -> list[str]:
                 str(int(row.get("games", 0))),
                 f"{float(row.get('score_pct', 0.0)):.2f}%",
                 f"{int(row.get('wins', 0))}-{int(row.get('draws', 0))}-{int(row.get('losses', 0))}",
+                f"{float(row.get('avg_depth', 0.0)):.2f}",
+                f"{float(row.get('avg_nps', 0.0)):.0f}",
                 f"{float(row.get('screen_elo', 0.0)):+.1f}",
                 qval_text,
             ]
@@ -1254,12 +1260,12 @@ SCREEN_CHECKPOINTS = env_int("STEINBEISSER_TRAIN_SCREEN_CHECKPOINTS", 3)
 TARGET_TRAIN_SAMPLES = env_int("STEINBEISSER_TRAIN_TARGET_SAMPLES", 15_000_000)
 TOURNAMENT_GAMES_PER_ENGINE = env_int(
     "STEINBEISSER_TRAIN_TOURNAMENT_GAMES_PER_ENGINE",
-    16_000,
+    7_500,
 )
-TOURNAMENT_CANDIDATES = env_int("STEINBEISSER_TRAIN_TOURNAMENT_CANDIDATES", 8)
+TOURNAMENT_CANDIDATES = env_int("STEINBEISSER_TRAIN_TOURNAMENT_CANDIDATES", 15)
 TOURNAMENT_CONDITION_GAMES = env_int(
     "STEINBEISSER_TRAIN_TOURNAMENT_CONDITION_GAMES",
-    1_000,
+    500,
 )
 TOURNAMENT_GAMES_PER_PAIRING_OVERRIDE = env_int(
     "STEINBEISSER_TRAIN_TOURNAMENT_GAMES_PER_PAIRING",
@@ -1350,7 +1356,8 @@ def current_run_signature() -> dict[str, object]:
         "train_patience": TRAIN_PATIENCE,
         "screen_checkpoints": SCREEN_CHECKPOINTS,
         "screen_games": MATCH_GAMES,
-        "ranking_games": BELGIAN_RANKING_GAMES,
+        "selection_opening": "random_only",
+        "qualification_protocol": "15_candidates_plus_release_500_per_matchup_10000x50_gate",
         "match_ms": MATCH_MS,
         "tournament_candidates": TOURNAMENT_CANDIDATES,
         "tournament_condition_games": TOURNAMENT_CONDITION_GAMES,
@@ -1366,8 +1373,6 @@ def current_run_signature() -> dict[str, object]:
         "selfplay_openings_sha256": file_sha256(OPENINGS),
         "screening_opening_source": str(screening_source),
         "screening_opening_source_sha256": file_sha256(screening_source),
-        "belgian_openings": str(BELGIAN_OPENINGS),
-        "belgian_openings_sha256": file_sha256(BELGIAN_OPENINGS),
         "tournament_opening_source": str(tournament_source),
         "tournament_opening_source_sha256": file_sha256(tournament_source),
     }
@@ -2125,9 +2130,8 @@ def setup() -> None:
         f"selfplay_ms={SELFPLAY_MS} "
         f"screen_ms={MATCH_MS} "
         f"screen_games={MATCH_GAMES} "
-        f"belgian_ranking_games={BELGIAN_RANKING_GAMES} "
-        f"tournament_candidates={TOURNAMENT_CANDIDATES} "
-        f"tournament_condition_games={TOURNAMENT_CONDITION_GAMES} "
+        f"tournament_entrants={TOURNAMENT_CANDIDATES + 1} "
+        f"tournament_games_per_matchup={TOURNAMENT_CONDITION_GAMES} "
         f"parallel_games={GENERATION_WORKERS} "
         f"tournament_parallel_matches={TOURNAMENT_PARALLEL_MATCHES} "
         f"tournament_target_games_per_engine={TOURNAMENT_GAMES_PER_ENGINE} "
@@ -2145,25 +2149,8 @@ def setup() -> None:
     )
     if MATCH_GAMES <= 0 or MATCH_GAMES % 2 != 0:
         raise SystemExit("STEINBEISSER_TRAIN_MATCH_GAMES must be a positive even number")
-    if BELGIAN_RANKING_GAMES <= 0 or BELGIAN_RANKING_GAMES % 2 != 0:
-        raise SystemExit(
-            "STEINBEISSER_TRAIN_BELGIAN_RANKING_GAMES must be a positive even number"
-        )
-    if TOURNAMENT_CONDITION_GAMES <= 0 or TOURNAMENT_CONDITION_GAMES % 2 != 0:
-        raise SystemExit(
-            "STEINBEISSER_TRAIN_TOURNAMENT_CONDITION_GAMES must be a positive even number"
-        )
-    if TOURNAMENT_CANDIDATES <= 0:
-        raise SystemExit("STEINBEISSER_TRAIN_TOURNAMENT_CANDIDATES must be positive")
-    expected_tournament_games = (
-        TOURNAMENT_CANDIDATES * 2 * TOURNAMENT_CONDITION_GAMES
-    )
-    if TOURNAMENT_GAMES_PER_ENGINE != expected_tournament_games:
-        raise SystemExit(
-            "STEINBEISSER_TRAIN_TOURNAMENT_GAMES_PER_ENGINE must equal "
-            f"{expected_tournament_games} for {TOURNAMENT_CANDIDATES} candidates "
-            f"and {TOURNAMENT_CONDITION_GAMES} games per condition"
-        )
+    if (TOURNAMENT_CANDIDATES, TOURNAMENT_CONDITION_GAMES, TOURNAMENT_GAMES_PER_ENGINE) != (15, 500, 7_500):
+        raise SystemExit("v2.7 qualification requires 15 candidates plus release, 500 games per matchup, and 7,500 games per entrant")
     if TOURNAMENT_PARALLEL_MATCHES <= 0:
         raise SystemExit("STEINBEISSER_TRAIN_TOURNAMENT_PARALLEL_MATCHES must be positive")
     if GENERATION_WORKERS <= 0 or CORE_BUDGET <= 0:
@@ -2191,8 +2178,7 @@ def setup() -> None:
     if TOURNAMENT_GAMES_PER_PAIRING_OVERRIDE:
         raise SystemExit(
             "STEINBEISSER_TRAIN_TOURNAMENT_GAMES_PER_PAIRING is incompatible with "
-            "the fixed Random + Belgian tournament; configure "
-            "STEINBEISSER_TRAIN_TOURNAMENT_CONDITION_GAMES instead"
+            "the fixed v2.7 random-only qualification protocol"
         )
     if MAX_ABS_SCORE < 0:
         raise SystemExit("STEINBEISSER_TRAIN_MAX_ABS_SCORE must be non-negative")
@@ -2200,7 +2186,7 @@ def setup() -> None:
     os.environ["CARGO_TARGET_DIR"] = str(CARGO_TARGET_DIR)
     for path in RUN_DIRS:
         path.mkdir(parents=True, exist_ok=True)
-    for required in [OPENINGS, BELGIAN_OPENINGS, NNUE_MANIFEST]:
+    for required in [OPENINGS, NNUE_MANIFEST]:
         if not required.exists():
             raise SystemExit(f"missing required path: {required}")
     emit_status("setup=openings")
@@ -2209,8 +2195,6 @@ def setup() -> None:
         OPENING_CONFIG,
         TOURNAMENT_CONDITION_GAMES // 2,
     )
-    if not read_fen_lines(BELGIAN_OPENINGS):
-        raise SystemExit(f"Belgian ranking opening file is empty: {BELGIAN_OPENINGS}")
     emit_status("setup=build_rust_tools")
     run(
         [
@@ -2468,6 +2452,14 @@ def train_cycle(cycle: int, corpus_dir: Path, train_samples: int) -> tuple[Path,
         f"experiment={experiment_dir}"
     )
     env = single_core_env()
+    # Base cycles always start from random weights, independent of any
+    # finetuning settings exported in the caller's shell.
+    for name in (
+        "STEINBEISSER_NNUE_INITIAL_MODEL",
+        "STEINBEISSER_NNUE_LEARNING_RATE",
+        "STEINBEISSER_NNUE_MIN_LEARNING_RATE",
+    ):
+        env.pop(name, None)
     env.update(
         {
             "STEINBEISSER_NNUE_TRAIN_PATH": str(corpus_dir / "train.sbin"),
@@ -2601,6 +2593,8 @@ def run_selfplay_match(
     payload = run_json_command(cmd, label="rust screen-match")
     if not isinstance(payload, dict):
         raise SystemExit("rust screen-match returned a non-object JSON payload")
+    if payload.get("forfeit"):
+        raise SystemExit("rust screen-match reported an engine forfeit")
     result = MatchResult(
         wins=int(payload["wins"]),
         draws=int(payload["draws"]),
@@ -3964,7 +3958,7 @@ def cleanup_final_artifacts() -> None:
     emit_status("cleanup=done retained=logs,training_bundle")
 
 
-def finish_training(state: RunState) -> None:
+def finish_training_legacy(state: RunState) -> None:
     rank_screened_candidates(state)
     if state.tournament_completed:
         summary = state.tournament_summary
@@ -4007,6 +4001,63 @@ def finish_training(state: RunState) -> None:
     state.training_data_export = export_positive_training_data(summary, state)
     state.save()
     cleanup_final_artifacts()
+
+
+def finish_training(state: RunState) -> None:
+    """Qualify the new base model on random openings only.
+
+    The previous Belgian-inclusive tournament is retained above for reading
+    historical run state, but it is not part of the v2.7 selection protocol.
+    """
+    from nnue.general_qualify import qualify
+
+    tournament_openings, _ = prepare_tournament_openings(OPENING_CONFIG, 250)
+    gate_openings = WORK_DIR / "release_gate_random_5000.fen"
+    if not gate_openings.is_file():
+        gate_rows = load_unique_book_openings(
+            OPENING_CONFIG.random_openings,
+            5_000,
+            "independent release gate",
+            skip=MATCH_GAMES // 2 + 250,
+        )
+        write_opening_file(gate_openings, gate_rows)
+    summary = qualify(
+        [row for row in state.screened_candidates if isinstance(row, dict)],
+        repo=REPO,
+        run_root=RUN_ROOT,
+        reference_ref=REFERENCE_REF,
+        reference_bin=REFERENCE_BIN,
+        selfplay_bin=SELFPLAY_BIN,
+        tournament_openings=tournament_openings,
+        gate_openings=gate_openings,
+        parallel_matches=TOURNAMENT_PARALLEL_MATCHES,
+    )
+    state.tournament_completed = True
+    state.tournament_summary = {
+        "protocol": "v27-random-only-16x500",
+        "selected_candidate_id": summary["winner"],
+        "standings": summary["standings"],
+        "release_gate": summary["release_gate"],
+        "release_gate_passed": summary["release_gate_passed"],
+    }
+    state.save()
+    emit_tournament_table([
+        {
+            **row,
+            "elo_vs_latest": row["elo_vs_release"],
+            "score_pct": 100.0 * (row["wins"] + 0.5 * row["draws"]) / row["games"],
+            "screen_elo": row.get("screen_elo", 0.0),
+            "qval_loss": row.get("qval_loss"),
+        }
+        for row in summary["standings"]
+    ])
+    gate = summary["release_gate"]
+    emit(
+        f"release_gate=done games={gate['games']} "
+        f"wdl={gate['wins']}-{gate['draws']}-{gate['losses']} "
+        f"elo={gate['elo']:+.2f}[{gate['elo_95_ci']}] "
+        f"passed={int(summary['release_gate_passed'])}"
+    )
 
 
 def raise_open_file_limit() -> None:
@@ -4188,7 +4239,7 @@ def emit_cycle_result(result: CycleResult) -> None:
     write_screening_plot(REFERENCE_REF)
 
 
-def run_smoke_test() -> int:
+def run_legacy_smoke_test() -> int:
     players = TOURNAMENT_CANDIDATES + 1
     pairings = players * (players - 1) // 2
     games_per_pairing = 2 * TOURNAMENT_CONDITION_GAMES
@@ -4277,6 +4328,21 @@ def run_smoke_test() -> int:
     print()
     print("\n".join(tournament_table_lines(standings)))
     print()
+    return 0
+
+
+def run_smoke_test() -> int:
+    """Print the v2.7 training and qualification protocol without launching jobs."""
+    from nnue.general_qualify import CANDIDATES, GAMES_PER_MATCHUP, GATE_GAMES, GATE_MS
+
+    entrants = CANDIDATES + 1
+    assert entrants == 16 and CANDIDATES * GAMES_PER_MATCHUP == 7_500
+    print(
+        f"cycles={MAX_CYCLES} increment={MIN_TRAIN_INCREMENT} "
+        f"screen={SCREEN_CHECKPOINTS}x{MATCH_GAMES}x{MATCH_MS}ms "
+        f"tournament={entrants}x{CANDIDATES * GAMES_PER_MATCHUP}x{MATCH_MS}ms "
+        f"gate={GATE_GAMES}x{GATE_MS}ms opening=random"
+    )
     return 0
 
 

@@ -1,0 +1,63 @@
+{
+  "version": "2.7",
+  "runtime": {
+    "default_embedded_model": "general",
+    "classical_model": "versioned_sidecar_not_automatically_selected"
+  },
+  "general": {
+    "model": "general.nnq",
+    "sha256": "2b65c9a2921e3a7bb52b73a03be24d86464788ce7410394ac4ee200b89b3bb51",
+    "training": {
+      "method": "from_scratch_500000_position_cycles",
+      "selected_cycle": 29,
+      "selected_epoch": 76,
+      "train_corpus_sha256": "73b8fb6517e7a05e5eedb79ce671c62c63c5e89bd42af97b699bbb825397ca95",
+      "validation_corpus_sha256": "ad260f72d31f2a2cd6806ed3082a0cde3e9b04465fc7018c9d285cece7d32c01"
+    },
+    "gate_vs_v2_6_1": {
+      "opening": "independent_random",
+      "time_ms": 50,
+      "games": 10000,
+      "wins": 3915,
+      "draws": 2470,
+      "losses": 3615,
+      "elo": 10.4,
+      "elo_95_ci": [6.1, 14.6],
+      "illegal_moves": 0,
+      "process_errors": 0
+    },
+    "results_sha256": "d7e2ee7a799b756ea8c6534c5af0520de3a4da52afafd8ea4fa013f46ae30cf2"
+  },
+  "classical": {
+    "model": "classical.nnq",
+    "sha256": "d6c567e91344c0e33a565e46614836b5f320dee0bc1f8119e9ef1775209d4774",
+    "training": {
+      "method": "finetune_general_on_root_only_teacher_selfplay",
+      "initial_model_sha256": "2b65c9a2921e3a7bb52b73a03be24d86464788ce7410394ac4ee200b89b3bb51",
+      "teacher_model_sha256": "5cdc5c6266aae4b3673f087da2d0d69de8bfbaacf9baf2b04067ba9278b429ed",
+      "train_samples": 500000,
+      "validation_samples": 10000,
+      "shared_train_validation_keys": 0,
+      "peak_learning_rate": 0.000015,
+      "selected_epoch": 3,
+      "epochs_playtested": 23,
+      "train_corpus_sha256": "c2c1c61daebd3301dbf2f5a06805691cf600ca0cd8b0ffa58825a6f2bf99dcd4",
+      "validation_corpus_sha256": "b5b421a20b6ec6a20af15c5701b3604f599944c9066e5dc6ac42e0969f4e445f"
+    },
+    "gate_vs_previous_classical": {
+      "opening": "exact_classical_root",
+      "time_ms": 50,
+      "games": 10000,
+      "wins": 237,
+      "draws": 9650,
+      "losses": 113,
+      "elo": 4.3,
+      "elo_95_ci": [3.0, 5.5],
+      "illegal_moves": 0,
+      "process_errors": 0
+    },
+    "epoch_sweep_sha256": "8973c346d589fd8258f993ce08cad1bbabf367860320aa3e7618393db25ef2f5",
+    "results_sha256": "964800eb1206a86f2f7edd586fc4ec64a9eaee315979c395c7045e981f1c3f88",
+    "final_match_log_sha256": "f16590e4e17c83eb7bda7fbc53a8bce177a0d7e610fc9abb8fa9012df3e0eb62"
+  }
+}
